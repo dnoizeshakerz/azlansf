@@ -1,0 +1,15 @@
+if [ "$#" -lt "1" ];then
+        echo "Must specify PHP ver. i.e 72"
+        exit;
+fi
+
+VER=$@
+
+yum install -y ea-php$VER-php-memcached
+yum -y install memcached
+systemctl enable memcached
+sed -e 's/OPTIONS="-l 127.0.0.1,::1"/OPTIONS="-l 127.0.0.1 -U 0"/g' -i /etc/sysconfig/memcached 
+sed -e 's/OPTIONS="-l 127.0.0.1"/OPTIONS="-l 127.0.0.1 -U 0"/g' -i /etc/sysconfig/memcached 
+systemctl restart memcached
+
+done
