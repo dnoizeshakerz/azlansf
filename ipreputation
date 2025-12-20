@@ -2,7 +2,7 @@
 
 grep -q '^CSF_MASTER|' /etc/csf/csf.blocklists || echo 'CSF_MASTER|43200|400000|https://raw.githubusercontent.com/Aetherinox/csf-firewall/main/blocklists/master.ipset' >> /etc/csf/csf.blocklists; \
 grep -q '^CSF_HIGHRISK|' /etc/csf/csf.blocklists || echo 'CSF_HIGHRISK|43200|0|https://raw.githubusercontent.com/Aetherinox/csf-firewall/main/blocklists/highrisk.ipset' >> /etc/csf/csf.blocklists; \
-grep -q '^ABUSEIPDB|' /etc/csf/csf.blocklists || echo 'ABUSEIPDB|86400|10000|https://api.abuseipdb.com/api/v2/blacklist?key=37ad3af1f74480836ac457830084616bb6cf5d26e96ffd39792a2abe545f2a1e7095c00b82a62f38&plaintext' >> /etc/csf/csf.blocklists; \
+grep -q '^ABUSEIPDB|' /etc/csf/csf.blocklists || echo 'CSF_PRIVACY_GENERAL|43200|0|https://blocklist.configserver.dev/privacy_general.ipset' >> /etc/csf/csf.blocklists; \
 sed -i \
   -e 's/^LF_IPSET_MAXELEM = ".*/LF_IPSET_MAXELEM = "400000"/' \
   -e 's/^LF_IPSET = ".*/LF_IPSET = "1"/' \
