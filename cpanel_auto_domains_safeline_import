@@ -1,0 +1,82 @@
+#!/bin/bash
+# cpanel_to_safeline.sh
+# Pull domains from cPanel/WHM and add to SafeLine WAF
+
+# --- CONFIGURATION ---
+CPANEL_USER="root"                     # SSH user for WHM/cPanel
+SAFELINE_HOST="dev.sfdns.net"
+SAFELINE_PORT="9443"
+SAFELINE_TOKEN="k1SWJxPvK8PyADQhH0u5p3YjIZJ0AcFb"
+LOG_FILE="/root/safeline_import_$(date +%F_%H%M).log"
+
+# --- FUNCTIONS ---
+log() {
+    echo -e "$1" | tee -a "$LOG_FILE"
+}
+
+get_cpanel_domains() {
+    # Pull all users
+    cpanel_users=$(whmapi1 listaccts | grep user: | awk '{print $2}')
+
+    domains=()
+    for user in $cpanel_users; do
+        # Get main domain
+        main_domain=$(whmapi1 accountsummary user=$user | grep domain: | awk '{print $2}')
+        [[ -n "$main_domain" ]] && domains+=("$main_domain")
+
+        # Get addon domains
+        addons=$(whmapi1 listaddondomains user=$user | grep domain: | awk '{print $2}')
+        [[ -n "$addons" ]] && domains+=($addons)
+
+        # Get subdomains
+        subs=$(whmapi1 listsupdomains user=$user | grep domain: | awk '{print $2}')
+        [[ -n "$subs" ]] && domains+=($subs)
+    done
+
+    # Remove duplicates
+    unique_domains=($(echo "${domains[@]}" | tr ' ' '\n' | sort -u))
+    echo "${unique_domains[@]}"
+}
+
+add_domain_safeline() {
+    local domain="$1"
+
+    read -r -d '' PAYLOAD <<EOF
+{
+  "ports": ["8080"],
+  "server_names": ["$domain"],
+  "upstreams": ["http://$domain:8080"],
+  "comment": "Imported from cPanel",
+  "load_balance": {"balance_type": 1}
+}
+EOF
+
+    RESPONSE=$(curl -s -X POST "https://$SAFELINE_HOST:$SAFELINE_PORT/api/open/site" \
+        -H "Content-Type: application/json" \
+        -H "X-SLCE-API-TOKEN: $SAFELINE_TOKEN" \
+        -d "$PAYLOAD" --insecure)
+
+    log "[*] Response for $domain: $RESPONSE"
+
+    if echo "$RESPONSE" | grep -q '"err":null'; then
+        log "[✔] Successfully added $domain"
+    else
+        log "[!] ⚠️ Failed to add $domain. Response: $RESPONSE"
+    fi
+}
+
+# --- MAIN ---
+log "[*] Starting cPanel -> SafeLine import process..."
+
+domains=$(get_cpanel_domains)
+
+if [[ -z "$domains" ]]; then
+    log "[!] No domains found on cPanel/WHM server."
+    exit 1
+fi
+
+for domain in $domains; do
+    add_domain_safeline "$domain"
+done
+
+log "[*] All domains processed. Log saved to: $LOG_FILE"
