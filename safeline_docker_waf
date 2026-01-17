@@ -1,0 +1,4 @@
+#!/bin/bash
+
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo ; dnf  -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin ; systemctl start docker ; systemctl enable docker
+bash -c "$(curl -fsSLk https://waf.chaitin.com/release/latest/manager.sh)" -- --en
