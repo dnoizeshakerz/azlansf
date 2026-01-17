@@ -43,9 +43,9 @@ add_domain_safeline() {
 
     read -r -d '' PAYLOAD <<EOF
 {
-  "ports": ["8080"],
+  "ports": ["8443"],
   "server_names": ["$domain"],
-  "upstreams": ["http://$domain:8080"],
+  "upstreams": ["http://$domain:8443"],
   "comment": "Imported from cPanel",
   "load_balance": {"balance_type": 1}
 }
