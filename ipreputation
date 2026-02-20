@@ -1,16 +1,87 @@
 #!/bin/bash
 
-#grep -q '^CSF_MASTER|' /etc/csf/csf.blocklists || echo 'CSF_MASTER|43200|400000|https://raw.githubusercontent.com/Aetherinox/csf-firewall/main/blocklists/master.ipset' >> /etc/csf/csf.blocklists; \
-grep -q '^DSHIELD|' /etc/csf/csf.blocklists || echo 'DSHIELD|86400|0|https://www.dshield.org/block.txt' >> /etc/csf/csf.blocklists; \
-grep -q '^GREENSNOW|' /etc/csf/csf.blocklists || echo 'GREENSNOW|86400|0|https://blocklist.greensnow.co/greensnow.txt' >> /etc/csf/csf.blocklists; \
-grep -q '^BOGON|' /etc/csf/csf.blocklists || echo 'BOGON|86400|0|http://www.cymru.com/Documents/bogon-bn-agg.txt' >> /etc/csf/csf.blocklists; \
-grep -q '^BDE|'  /etc/csf/csf.blocklists || echo 'BDE|3600|0|https://api.blocklist.de/getlast.php?time=3600'  >> /etc/csf/csf.blocklists; \
-grep -q '^CSF_HIGHRISK|' /etc/csf/csf.blocklists || echo 'CSF_HIGHRISK|43200|0|https://raw.githubusercontent.com/Aetherinox/csf-firewall/main/blocklists/highrisk.ipset' >> /etc/csf/csf.blocklists; \
-grep -q '^CSF_PRIVACY_GENERAL|' /etc/csf/csf.blocklists || echo 'CSF_PRIVACY_GENERAL|43200|0|https://blocklist.configserver.dev/privacy_general.ipset' >> /etc/csf/csf.blocklists; \
+CSF_BLOCKLIST="/etc/csf/csf.blocklists"
+CSF_CONF="/etc/csf/csf.conf"
+CSF_DYNDNS="/etc/csf/csf.dyndns"
+
+add_blocklist() {
+    local NAME="$1"
+    local INTERVAL="$2"
+    local MAX="$3"
+    local URL="$4"
+
+    grep -q "^${NAME}|" "$CSF_BLOCKLIST" || \
+    echo "${NAME}|${INTERVAL}|${MAX}|${URL}" >> "$CSF_BLOCKLIST"
+}
+
+# -------------------------
+# Spamhaus Lists
+# -------------------------
+add_blocklist "SPAMDROP"    "86400" "0" "http://www.spamhaus.org/drop/drop.txt"
+add_blocklist "SPAMDROPV6"  "86400" "0" "https://www.spamhaus.org/drop/dropv6.txt"
+add_blocklist "SPAMEDROP"   "86400" "0" "http://www.spamhaus.org/drop/edrop.txt"
+
+# -------------------------
+# DShield
+# -------------------------
+add_blocklist "DSHIELD"     "86400" "0" "https://www.dshield.org/block.txt"
+
+# -------------------------
+# BOGON
+# -------------------------
+add_blocklist "BOGON"       "86400" "0" "http://www.cymru.com/Documents/bogon-bn-agg.txt"
+
+# -------------------------
+# Project Honey Pot
+# -------------------------
+add_blocklist "HONEYPOT"    "86400" "0" "https://www.projecthoneypot.org/list_of_ips.php?t=d&rss=1"
+
+# -------------------------
+# C.I. Army
+# -------------------------
+add_blocklist "CIARMY"      "86400" "0" "http://www.ciarmy.com/list/ci-badguys.txt"
+
+# -------------------------
+# GreenSnow
+# -------------------------
+add_blocklist "GREENSNOW"   "86400" "0" "https://blocklist.greensnow.co/greensnow.txt"
+
+# -------------------------
+# Blocklist.de
+# -------------------------
+add_blocklist "BDEALL"      "86400" "0" "http://lists.blocklist.de/lists/all.txt"
+
+# -------------------------
+# Your Custom Lists
+# -------------------------
+add_blocklist "CSF_HIGHRISK"        "43200" "0" "https://raw.githubusercontent.com/Aetherinox/csf-firewall/main/blocklists/highrisk.ipset"
+add_blocklist "CSF_PRIVACY_GENERAL" "43200" "0" "https://blocklist.configserver.dev/privacy_general.ipset"
+
+# -------------------------
+# Optimize CSF Settings
+# -------------------------
 sed -i \
   -e 's/^LF_IPSET_MAXELEM = ".*/LF_IPSET_MAXELEM = "400000"/' \
   -e 's/^LF_IPSET = ".*/LF_IPSET = "1"/' \
   -e 's/^DYNDNS = ".*/DYNDNS = "300"/' \
-  /etc/csf/csf.conf; \
-grep -qxF 'aci.serverfreak.com' /etc/csf/csf.dyndns || echo 'aci.serverfreak.com' >> /etc/csf/csf.dyndns; \
-csf -a 10.0.10.223 && csf -a 10.0.7.241 && csf -ra
+  -e 's/^URLGET = ".*/URLGET = "2"/' \
+  "$CSF_CONF"
+
+# -------------------------
+# Add DYNDNS entry if missing
+# -------------------------
+grep -qxF 'aci.serverfreak.com' "$CSF_DYNDNS" || \
+echo 'aci.serverfreak.com' >> "$CSF_DYNDNS"
+
+# -------------------------
+# Allow Internal IPs
+# -------------------------
+csf -a 10.0.10.223
+csf -a 10.0.7.241
+
+# -------------------------
+# Restart CSF
+# -------------------------
+csf -ra
+
+echo "CSF blocklists and configuration updated successfully."
