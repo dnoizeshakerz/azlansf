@@ -1,0 +1,39 @@
+#!/bin/bash
+# Bulk fix: Add OLS listener mappings for all cPanel addon domains
+# Run as root. Safe to re-run — skips already-mapped domains.
+# Replace ADMIN_PASS with your OLS WebAdmin password.
+
+OLS_ADMIN="https://127.0.0.1:7080"
+ADMIN_USER="admin"
+ADMIN_PASS="YOUR_OLS_ADMIN_PASS"
+LISTENER="Default"
+
+for user_dir in /var/cpanel/userdata/*/; do
+    username=$(basename "$user_dir")
+    for f in "${user_dir}"*; do
+        fname=$(basename "$f")
+        # Skip SSL variants, cache dir, and the main account file
+        [[ "$fname" == *"_SSL" ]] && continue
+        [[ "$fname" == "$username" ]] && continue
+        [[ -d "$f" ]] && continue
+
+        servername=$(awk '/^servername:/{print $2; exit}' "$f" 2>/dev/null)
+        [ -z "$servername" ] && continue
+
+        # The addon domain is the part of the filename before the first dot
+        # e.g. icha.design.wms.edu.my -> addon is icha.design
+        addon=$(echo "$fname" | sed 's/\.[^.]*$//' )
+        # Verify this alias actually appears in the file
+        grep -qi "$addon" "$f" 2>/dev/null || continue
+
+        echo "Adding: $addon -> vhost $servername"
+        curl -ksSf -u "${ADMIN_USER}:${ADMIN_PASS}" \
+            -d "vhost=${servername}&domain=${addon},www.${addon}" \
+            "${OLS_ADMIN}/api/listeners/${LISTENER}/vhmap" 2>&1
+    done
+done
+
+echo ""
+echo "Applying graceful restart..."
+/usr/local/lsws/bin/lswsctrl graceful
+echo "Done."
