@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Serverfreak Instant Cache
  * Description: Production-grade full-page cache with .htaccess rewrite. WooCommerce + CartFlows + multisite aware. Zero config.
- * Version: 3.0.0
+ * Version: 3.0.1
  * Author: Assistant
  * Network: true
  */
@@ -13,10 +13,6 @@ if (!defined('ABSPATH')) {
 
 /**
  * Serverfreak Instant Cache
- * 
- * Now with dual delivery:
- * 1. .htaccess mod_rewrite (Apache serves file directly, PHP never loads)
- * 2. PHP fallback (nginx, or when rewrite misses)
  */
 final class Serverfreak_Instant_Cache {
 
@@ -30,8 +26,6 @@ final class Serverfreak_Instant_Cache {
     private array $dynamic_patterns = [];
     private ?bool $has_object_cache = null;
     private bool $dynamic_pages_built = false;
-    private bool $is_cache_hit = false;
-    private int $cache_time = 0;
 
     private const CACHE_GROUP = 'serverfreak_cache';
     private const HEADER_HIT = 'X-Cache-Status';
@@ -60,9 +54,6 @@ final class Serverfreak_Instant_Cache {
         return $this->has_object_cache;
     }
 
-    /**
-     * Setup cache directory and URL path for rewrite rules
-     */
     private function setup_cache_directory(): void {
         $base_dir = WP_CONTENT_DIR . '/cache/serverfreak-cache/';
         $base_url = content_url() . '/cache/serverfreak-cache/';
@@ -79,7 +70,6 @@ final class Serverfreak_Instant_Cache {
         if (!is_dir($this->cache_dir)) {
             wp_mkdir_p($this->cache_dir);
 
-            // Protect with .htaccess (deny direct access to raw cache)
             $htaccess = $this->cache_dir . '.htaccess';
             if (!file_exists($htaccess)) {
                 @file_put_contents($htaccess, "Options -Indexes\n<<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n", LOCK_EX);
@@ -121,8 +111,12 @@ final class Serverfreak_Instant_Cache {
         add_action('switch_theme', [$this, 'clear_all_cache'], 10, 0);
         add_action('wp_trash_post', [$this, 'handle_post_trash'], 10, 1);
 
-        // Rewrite rules
+        // .htaccess rewrite rules - try multiple methods
         add_filter('mod_rewrite_rules', [$this, 'add_rewrite_rules'], PHP_INT_MAX);
+        
+        // Direct .htaccess write on activation and when needed
+        add_action('activate_' . plugin_basename(__FILE__), [$this, 'write_htaccess_directly']);
+        add_action('wp_loaded', [$this, 'maybe_write_htaccess'], PHP_INT_MAX);
 
         if (is_multisite()) {
             add_action('wp_uninitialize_blog', [$this, 'handle_blog_delete'], 10, 1);
@@ -134,8 +128,114 @@ final class Serverfreak_Instant_Cache {
     }
 
     /**
-     * SAFE early bail — NO pluggable functions
+     * Try to write .htaccess directly if WordPress hasn't done it
      */
+    public function maybe_write_htaccess(): void {
+        // Only run once per request
+        static $done = false;
+        if ($done) return;
+        $done = true;
+
+        // Check if our rules are already in .htaccess
+        $htaccess_file = ABSPATH . '.htaccess';
+        if (!file_exists($htaccess_file)) return;
+
+        $content = @file_get_contents($htaccess_file);
+        if ($content === false) return;
+
+        if (strpos($content, '# Serverfreak Instant Cache') !== false) return;
+
+        // Not there - try to add directly
+        $this->write_htaccess_directly();
+    }
+
+    /**
+     * Write cache rewrite rules directly to .htaccess
+     */
+    public function write_htaccess_directly(): void {
+        $htaccess_file = ABSPATH . '.htaccess';
+        
+        // Get the cache path relative to document root
+        $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
+        $cache_path = ltrim($cache_path, '/');
+
+        $rules = "\n";
+        $rules .= "# Serverfreak Instant Cache\n";
+        $rules .= "<<IfModule mod_rewrite.c>\n";
+        $rules .= "RewriteEngine On\n";
+        $rules .= "RewriteCond %{REQUEST_METHOD} GET\n";
+        $rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]\n";
+        $rules .= "RewriteCond %{QUERY_STRING} ^$\n";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]\n";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]\n";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]\n";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
+        $rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
+        $rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f\n";
+        $rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]\n";
+        $rules .= "<</IfModule>\n";
+        $rules .= "# /Serverfreak Instant Cache\n";
+
+        if (file_exists($htaccess_file) && is_writable($htaccess_file)) {
+            $content = file_get_contents($htaccess_file);
+            
+            // Remove old rules if present
+            $content = preg_replace('/\n# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache\n/s', '', $content);
+            
+            // Add before WordPress section
+            $wp_begin = '# BEGIN WordPress';
+            if (strpos($content, $wp_begin) !== false) {
+                $content = str_replace($wp_begin, $rules . $wp_begin, $content);
+            } else {
+                $content .= $rules;
+            }
+
+            @file_put_contents($htaccess_file, $content, LOCK_EX);
+        }
+    }
+
+    /**
+     * Remove our rules from .htaccess
+     */
+    public function remove_htaccess_rules(): void {
+        $htaccess_file = ABSPATH . '.htaccess';
+        if (!file_exists($htaccess_file)) return;
+
+        $content = @file_get_contents($htaccess_file);
+        if ($content === false) return;
+
+        $content = preg_replace('/\n# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache\n/s', '', $content);
+        @file_put_contents($htaccess_file, $content, LOCK_EX);
+    }
+
+    /**
+     * Add rewrite rules via WordPress filter (backup method)
+     */
+    public function add_rewrite_rules(string $rules): string {
+        if (strpos($rules, '# Serverfreak Instant Cache') !== false) {
+            return $rules;
+        }
+
+        $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
+        $cache_path = ltrim($cache_path, '/');
+
+        $new_rules = "\n";
+        $new_rules .= "# Serverfreak Instant Cache\n";
+        $new_rules .= "RewriteCond %{REQUEST_METHOD} GET\n";
+        $new_rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]\n";
+        $new_rules .= "RewriteCond %{QUERY_STRING} ^$\n";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]\n";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]\n";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]\n";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
+        $new_rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
+        $new_rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f\n";
+        $new_rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]\n";
+        $new_rules .= "# /Serverfreak Instant Cache\n";
+
+        return $new_rules . $rules;
+    }
+
     private function early_bail_check_safe(): bool {
         if (is_admin()) return true;
         if (defined('DOING_AJAX') && DOING_AJAX) return true;
@@ -148,36 +248,6 @@ final class Serverfreak_Instant_Cache {
         if (isset($_GET['preview']) || isset($_GET['preview_id'])) return true;
         if (!empty($_SERVER['HTTP_REFERER']) && stripos($_SERVER['HTTP_REFERER'], 'trackback') !== false) return true;
         return false;
-    }
-
-    /**
-     * Add mod_rewrite rules to .htaccess for direct file serving
-     */
-    public function add_rewrite_rules(string $rules): string {
-        // Only add if not already present
-        if (strpos($rules, '# Serverfreak Instant Cache') !== false) {
-            return $rules;
-        }
-
-        $cache_dir = $this->cache_dir;
-        $cache_url_path = parse_url($this->cache_url, PHP_URL_PATH);
-
-        $rewrite = "\n";
-        $rewrite .= "# Serverfreak Instant Cache\n";
-        $rewrite .= "<<IfModule mod_rewrite.c>\n";
-        $rewrite .= "RewriteEngine On\n";
-        $rewrite .= "RewriteCond %{REQUEST_METHOD} GET\n";
-        $rewrite .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]\n";
-        $rewrite .= "RewriteCond %{QUERY_STRING} ^$\n";
-        $rewrite .= "RewriteCond %{HTTP_COOKIE} !^.*(wordpress_logged_in|wp_woocommerce_session|woocommerce_items_in_cart|woocommerce_cart_hash).*$ [NC]\n";
-        $rewrite .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|cart|checkout|my-account|wc-api|wc-ajax|cartflows) [NC]\n";
-        $rewrite .= "RewriteCond %{DOCUMENT_ROOT}" . $cache_url_path . "%{REQUEST_URI}.html -f [OR]\n";
-        $rewrite .= "RewriteCond %{DOCUMENT_ROOT}" . $cache_url_path . "%{REQUEST_URI}/index.html -f\n";
-        $rewrite .= "RewriteRule ^(.*)$ " . $cache_url_path . "$1.html [L]\n";
-        $rewrite .= "<</IfModule>\n";
-        $rewrite .= "# /Serverfreak Instant Cache\n";
-
-        return $rules . $rewrite;
     }
 
     public function late_init(): void {
@@ -195,7 +265,7 @@ final class Serverfreak_Instant_Cache {
             return;
         }
 
-        // PHP fallback cache serve (for nginx or when rewrite misses)
+        // PHP fallback cache serve (for nginx or when .htaccess rewrite misses)
         add_action('template_redirect', [$this, 'try_serve_cache'], PHP_INT_MIN);
         add_action('template_redirect', [$this, 'start_capture'], PHP_INT_MAX);
     }
@@ -381,9 +451,6 @@ final class Serverfreak_Instant_Cache {
         return $this->cache_dir . $this->get_cache_key() . '.lock';
     }
 
-    /**
-     * Generate cache footer HTML comment
-     */
     private function get_cache_footer(int $cache_time, bool $is_hit): string {
         if (!apply_filters('serverfreak_cache_show_footer', true)) return '';
 
@@ -393,13 +460,7 @@ final class Serverfreak_Instant_Cache {
         $storage = $this->has_object_cache() ? 'Object+Filesystem' : 'Filesystem';
 
         return sprintf(
-            "\n<!--\n"
-            . "  Serverfreak Instant Cache\n"
-            . "  Status: %s\n"
-            . "  Cached: %s ago\n"
-            . "  Expires in: %s\n"
-            . "  Storage: %s\n"
-            . "-->\n",
+            "\n<!--\n  Serverfreak Instant Cache\n  Status: %s\n  Cached: %s ago\n  Expires in: %s\n  Storage: %s\n-->\n",
             $mode,
             $age,
             $ttl_remaining,
@@ -407,21 +468,15 @@ final class Serverfreak_Instant_Cache {
         );
     }
 
-    /**
-     * PHP fallback cache serve (for nginx or when .htaccess rewrite misses)
-     */
     public function try_serve_cache(): void {
         if ($this->skip) return;
 
         $cache_file = $this->get_cache_file();
         $meta_file = $this->get_cache_meta();
 
-        // Object cache check
         if ($this->has_object_cache()) {
             $cached = wp_cache_get($this->get_cache_key(), self::CACHE_GROUP);
             if (is_array($cached) && !empty($cached['content']) && (time() - $cached['time']) < $this->ttl) {
-                $this->cache_time = $cached['time'];
-                $this->is_cache_hit = true;
                 $this->send_cache_headers($cached['time'], true);
                 echo $cached['content'];
                 echo $this->get_cache_footer($cached['time'], true);
@@ -461,8 +516,6 @@ final class Serverfreak_Instant_Cache {
             return;
         }
 
-        $this->cache_time = $meta['time'];
-        $this->is_cache_hit = true;
         $this->send_cache_headers($meta['time'], true);
 
         if ($this->has_object_cache()) {
@@ -526,7 +579,6 @@ final class Serverfreak_Instant_Cache {
         }
         rename($meta_temp, $meta_file);
 
-        // Store content with footer for cache file
         $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
 
         $cache_temp = $cache_file . '.tmp';
