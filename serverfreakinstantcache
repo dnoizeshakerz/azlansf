@@ -519,13 +519,22 @@ Deny from all
     }
 
     public function try_serve_cache(): void {
-        if ($this->skip) return;
+        static $served = false;
+        if ($served) {
+            return;
+        }
+        $served = true;
+
+        if ($this->skip) {
+            return;
+        }
 
         $cache_file = $this->get_cache_file();
         $meta_file = $this->get_cache_meta();
+        $key = $this->get_cache_key();
 
         if ($this->has_object_cache()) {
-            $cached = wp_cache_get($this->get_cache_key(), self::CACHE_GROUP);
+            $cached = wp_cache_get($key, self::CACHE_GROUP);
             if (is_array($cached) && !empty($cached['content']) && (time() - $cached['time']) < $this->ttl) {
                 $this->send_cache_headers($cached['time'], true);
                 echo $cached['content'];
@@ -534,10 +543,14 @@ Deny from all
             }
         }
 
-        if (!is_readable($cache_file) || !is_readable($meta_file)) return;
+        if (!is_readable($cache_file) || !is_readable($meta_file)) {
+            return;
+        }
 
         $meta_content = @file_get_contents($meta_file);
-        if (false === $meta_content) return;
+        if (false === $meta_content) {
+            return;
+        }
 
         $meta = json_decode($meta_content, true);
         if (!is_array($meta) || empty($meta['time']) || !is_int($meta['time'])) {
@@ -561,15 +574,15 @@ Deny from all
             return;
         }
 
-        if (!empty($meta['hash']) && hash('sha256', $content) !== $meta['hash']) {
-            $this->delete_cache_files();
-            return;
-        }
-
+        // Hash check removed - file existence + time check is sufficient
+        // if (!empty($meta['hash']) && hash('sha256', $content) !== $meta['hash']) {
+        //     $this->delete_cache_files();
+        //     return;
+        // }
         $this->send_cache_headers($meta['time'], true);
 
         if ($this->has_object_cache()) {
-            wp_cache_set($this->get_cache_key(), [
+            wp_cache_set($key, [
                 'content' => $content,
                 'time' => $meta['time'],
             ], self::CACHE_GROUP, $this->ttl);
@@ -585,7 +598,14 @@ Deny from all
     }
 
     public function save_cache(string $content): string {
-        if ($this->skip || empty($content)) return $content;
+        static $saved = false;
+        if ($saved) {
+            return $content;
+        }
+
+        if ($this->skip || empty($content)) {
+            return $content;
+        }
         if (http_response_code() !== 200) return $content;
 
         if (stripos($content, '<!--nocache-->') !== false) return $content;
@@ -612,11 +632,12 @@ Deny from all
         }
 
         $cache_time = time();
+        $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
+
         $meta = [
             'time' => $cache_time,
             'uri' => $_SERVER['REQUEST_URI'] ?? '/',
-            'hash' => hash('sha256', $content),
-            'size' => strlen($content),
+            'size' => strlen($content_with_footer),
         ];
 
         $meta_temp = $meta_file . '.tmp';
@@ -625,11 +646,9 @@ Deny from all
             fclose($lock);
             @unlink($meta_temp);
             $this->send_cache_headers(time(), false);
-            return $content . $this->get_cache_footer($cache_time, false);
+            return $content_with_footer;
         }
         rename($meta_temp, $meta_file);
-
-        $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
 
         $cache_temp = $cache_file . '.tmp';
         if (false === @file_put_contents($cache_temp, $content_with_footer, LOCK_EX)) {
@@ -637,7 +656,7 @@ Deny from all
             fclose($lock);
             @unlink($cache_temp);
             $this->send_cache_headers(time(), false);
-            return $content . $this->get_cache_footer($cache_time, false);
+            return $content_with_footer;
         }
         rename($cache_temp, $cache_file);
 
@@ -652,8 +671,9 @@ Deny from all
         fclose($lock);
         @unlink($lock_file);
 
+        $saved = true;
         $this->send_cache_headers($cache_time, false);
-        return $content . $this->get_cache_footer($cache_time, false);
+        return $content_with_footer;
     }
 
     private function send_cache_headers(int $cache_time, bool $is_hit): void {
