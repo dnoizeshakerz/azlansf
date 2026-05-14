@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Serverfreak Instant Cache
- * Description: Production-grade full-page cache with .htaccess rewrite. WooCommerce + CartFlows + multisite aware. Zero config.
- * Version: 3.0.2
+ * Description: Production-grade full-page cache. WooCommerce + CartFlows + multisite aware. Zero config.
+ * Version: 3.1.0
  * Author: Assistant
  * Network: true
  */
@@ -11,20 +11,15 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-/**
- * Serverfreak Instant Cache
- */
 final class Serverfreak_Instant_Cache {
 
     private static ?self $instance = null;
     private string $cache_dir;
-    private string $cache_url;
     private int $ttl;
     private bool $skip = false;
     private ?string $cache_key = null;
     private array $dynamic_page_ids = [];
     private array $dynamic_patterns = [];
-    private ?bool $has_object_cache = null;
     private bool $dynamic_pages_built = false;
 
     private const CACHE_GROUP = 'serverfreak_cache';
@@ -46,25 +41,14 @@ final class Serverfreak_Instant_Cache {
 
     private function __clone() {}
 
-    private function has_object_cache(): bool {
-        if (null === $this->has_object_cache) {
-            $status = wp_using_ext_object_cache();
-            $this->has_object_cache = ($status === true);
-        }
-        return $this->has_object_cache;
-    }
-
     private function setup_cache_directory(): void {
         $base_dir = WP_CONTENT_DIR . '/cache/serverfreak-cache/';
-        $base_url = content_url() . '/cache/serverfreak-cache/';
 
         if (is_multisite()) {
             $blog_id = get_current_blog_id();
             $this->cache_dir = $base_dir . 'site-' . $blog_id . '/';
-            $this->cache_url = $base_url . 'site-' . $blog_id . '/';
         } else {
             $this->cache_dir = $base_dir . 'default/';
-            $this->cache_url = $base_url . 'default/';
         }
 
         if (!is_dir($this->cache_dir)) {
@@ -113,7 +97,6 @@ Deny from all
 
         add_action('wp', [$this, 'late_init'], PHP_INT_MIN);
 
-        // Auto-clear hooks
         add_action('save_post', [$this, 'handle_post_save'], 10, 3);
         add_action('woocommerce_order_status_changed', [$this, 'clear_all_cache'], 10, 0);
         add_action('cartflows_order_status_changed', [$this, 'clear_all_cache'], 10, 0);
@@ -122,13 +105,8 @@ Deny from all
         add_action('switch_theme', [$this, 'clear_all_cache'], 10, 0);
         add_action('wp_trash_post', [$this, 'handle_post_trash'], 10, 1);
 
-        // .htaccess rewrite rules
         add_filter('mod_rewrite_rules', [$this, 'add_rewrite_rules'], PHP_INT_MAX);
-
-        // Direct .htaccess write on activation
         add_action('activate_' . plugin_basename(__FILE__), [$this, 'write_htaccess_directly']);
-
-        // Check and write on wp_loaded if needed
         add_action('wp_loaded', [$this, 'maybe_write_htaccess'], PHP_INT_MAX);
 
         if (is_multisite()) {
@@ -140,9 +118,20 @@ Deny from all
         }
     }
 
-    /**
-     * Try to write .htaccess directly if WordPress hasn't done it
-     */
+    private function early_bail_check_safe(): bool {
+        if (is_admin()) return true;
+        if (defined('DOING_AJAX') && DOING_AJAX) return true;
+        if (defined('DOING_CRON') && DOING_CRON) return true;
+        if (defined('REST_REQUEST') && REST_REQUEST) return true;
+        if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) return true;
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET') return true;
+        if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'robots.txt') !== false) return true;
+        if (isset($_SERVER['REQUEST_URI']) && preg_match('/sitemap.*\.xml$/i', $_SERVER['REQUEST_URI'])) return true;
+        if (isset($_GET['preview']) || isset($_GET['preview_id'])) return true;
+        if (!empty($_SERVER['HTTP_REFERER']) && stripos($_SERVER['HTTP_REFERER'], 'trackback') !== false) return true;
+        return false;
+    }
+
     public function maybe_write_htaccess(): void {
         static $done = false;
         if ($done) return;
@@ -159,12 +148,8 @@ Deny from all
         $this->write_htaccess_directly();
     }
 
-    /**
-     * Write cache rewrite rules directly to .htaccess
-     */
     public function write_htaccess_directly(): void {
         $htaccess_file = ABSPATH . '.htaccess';
-
         $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
         $cache_path = ltrim($cache_path, '/');
 
@@ -203,13 +188,10 @@ Deny from all
 
         if (file_exists($htaccess_file) && is_writable($htaccess_file)) {
             $content = file_get_contents($htaccess_file);
-
-            // Remove old rules if present
             $content = preg_replace('/
 # Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache
 /s', '', $content);
 
-            // Add before WordPress section
             $wp_begin = '# BEGIN WordPress';
             if (strpos($content, $wp_begin) !== false) {
                 $content = str_replace($wp_begin, $rules . $wp_begin, $content);
@@ -221,9 +203,6 @@ Deny from all
         }
     }
 
-    /**
-     * Remove our rules from .htaccess
-     */
     public function remove_htaccess_rules(): void {
         $htaccess_file = ABSPATH . '.htaccess';
         if (!file_exists($htaccess_file)) return;
@@ -237,13 +216,8 @@ Deny from all
         @file_put_contents($htaccess_file, $content, LOCK_EX);
     }
 
-    /**
-     * Add rewrite rules via WordPress filter (backup method)
-     */
     public function add_rewrite_rules(string $rules): string {
-        if (strpos($rules, '# Serverfreak Instant Cache') !== false) {
-            return $rules;
-        }
+        if (strpos($rules, '# Serverfreak Instant Cache') !== false) return $rules;
 
         $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
         $cache_path = ltrim($cache_path, '/');
@@ -278,20 +252,6 @@ Deny from all
         return $new_rules . $rules;
     }
 
-    private function early_bail_check_safe(): bool {
-        if (is_admin()) return true;
-        if (defined('DOING_AJAX') && DOING_AJAX) return true;
-        if (defined('DOING_CRON') && DOING_CRON) return true;
-        if (defined('REST_REQUEST') && REST_REQUEST) return true;
-        if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) return true;
-        if ($_SERVER['REQUEST_METHOD'] !== 'GET') return true;
-        if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'robots.txt') !== false) return true;
-        if (isset($_SERVER['REQUEST_URI']) && preg_match('/sitemap.*\.xml$/i', $_SERVER['REQUEST_URI'])) return true;
-        if (isset($_GET['preview']) || isset($_GET['preview_id'])) return true;
-        if (!empty($_SERVER['HTTP_REFERER']) && stripos($_SERVER['HTTP_REFERER'], 'trackback') !== false) return true;
-        return false;
-    }
-
     public function late_init(): void {
         if ($this->should_skip_logged_in()) {
             $this->skip = true;
@@ -307,9 +267,10 @@ Deny from all
             return;
         }
 
-        // PHP fallback cache serve (for nginx or when .htaccess rewrite misses)
-        add_action('template_redirect', [$this, 'try_serve_cache'], PHP_INT_MIN);
-        add_action('template_redirect', [$this, 'start_capture'], PHP_INT_MAX);
+        // SIMPLE WORKING FLOW from minimal version:
+        // serve() at priority 1 (early), capture() at priority 99999 (late)
+        add_action('template_redirect', [$this, 'try_serve_cache'], 1);
+        add_action('template_redirect', [$this, 'start_capture'], 99999);
     }
 
     private function should_skip_logged_in(): bool {
@@ -489,20 +450,13 @@ Deny from all
         return $this->cache_dir . $this->get_cache_key() . '.json';
     }
 
-    private function get_lock_file(): string {
-        return $this->cache_dir . $this->get_cache_key() . '.lock';
-    }
-
     private function get_cache_footer(int $cache_time, bool $is_hit): string {
         if (!apply_filters('serverfreak_cache_show_footer', true)) return '';
 
         $age = human_time_diff($cache_time, time());
         $ttl_remaining = human_time_diff(time(), $cache_time + $this->ttl);
         $mode = $is_hit ? 'HIT' : 'MISS';
-        $storage = $this->has_object_cache() ? 'Object+Filesystem' : 'Filesystem';
-        $key = $this->get_cache_key();
-        $file = basename($this->get_cache_file());
-        $file_exists = file_exists($this->get_cache_file()) ? 'yes' : 'no';
+        $storage = wp_using_ext_object_cache() ? 'Object+Filesystem' : 'Filesystem';
 
         return sprintf(
             "
@@ -512,96 +466,45 @@ Deny from all
   Cached: %s ago
   Expires in: %s
   Storage: %s
-  Key: %s
-  File: %s
-  FileExists: %s
-  Skip: %s
-  URI: %s
 -->
 ",
             $mode,
             $age,
             $ttl_remaining,
-            $storage,
-            $key,
-            $file,
-            $file_exists,
-            $this->skip ? 'true' : 'false',
-            $_SERVER['REQUEST_URI'] ?? 'none'
+            $storage
         );
     }
 
+    /**
+     * Serve cached file - simplified working version
+     */
     public function try_serve_cache(): void {
-        static $served = false;
-        if ($served) {
-            return;
-        }
-        $served = true;
-
-        if ($this->skip) {
-            return;
-        }
+        if ($this->skip) return;
 
         $cache_file = $this->get_cache_file();
-        $meta_file = $this->get_cache_meta();
-        $key = $this->get_cache_key();
 
-        if ($this->has_object_cache()) {
-            $cached = wp_cache_get($key, self::CACHE_GROUP);
-            if (is_array($cached) && !empty($cached['content']) && (time() - $cached['time']) < $this->ttl) {
-                $this->send_cache_headers($cached['time'], true);
-                echo $cached['content'];
-                echo $this->get_cache_footer($cached['time'], true);
-                exit;
-            }
-        }
+        if (!file_exists($cache_file)) return;
 
-        if (!is_readable($cache_file) || !is_readable($meta_file)) {
-            return;
-        }
-
-        $meta_content = @file_get_contents($meta_file);
-        if (false === $meta_content) {
-            return;
-        }
-
-        $meta = json_decode($meta_content, true);
-        if (!is_array($meta) || empty($meta['time']) || !is_int($meta['time'])) {
-            $this->delete_cache_files();
-            return;
-        }
-        if ((time() - $meta['time']) > $this->ttl) {
-            $this->delete_cache_files();
+        $age = time() - filemtime($cache_file);
+        if ($age > $this->ttl) {
+            unlink($cache_file);
+            @unlink($this->get_cache_meta());
             return;
         }
 
         $file_size = filesize($cache_file);
         if (false === $file_size || $file_size > self::MAX_FILE_SIZE) {
-            $this->delete_cache_files();
+            unlink($cache_file);
+            @unlink($this->get_cache_meta());
             return;
         }
 
-        $content = @file_get_contents($cache_file);
-        if (false === $content || empty($content)) {
-            $this->delete_cache_files();
-            return;
-        }
+        header(self::HEADER_HIT . ': HIT');
+        header('Age: ' . $age);
+        header('Cache-Control: public, max-age=' . max(0, $this->ttl - $age));
+        header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + max(0, $this->ttl - $age)));
 
-        // Hash check removed - file existence + time check is sufficient
-        // if (!empty($meta['hash']) && hash('sha256', $content) !== $meta['hash']) {
-        //     $this->delete_cache_files();
-        //     return;
-        // }
-        $this->send_cache_headers($meta['time'], true);
-
-        if ($this->has_object_cache()) {
-            wp_cache_set($key, [
-                'content' => $content,
-                'time' => $meta['time'],
-            ], self::CACHE_GROUP, $this->ttl);
-        }
-
-        echo $content;
+        readfile($cache_file);
         exit;
     }
 
@@ -611,40 +514,20 @@ Deny from all
     }
 
     public function save_cache(string $content): string {
-        static $saved = false;
-        if ($saved) {
-            return $content;
-        }
-
-        if ($this->skip || empty($content)) {
-            return $content;
-        }
+        if ($this->skip || empty($content)) return $content;
         if (http_response_code() !== 200) return $content;
 
         if (stripos($content, '<!--nocache-->') !== false) return $content;
         if (stripos($content, 'wc_fragments') !== false || stripos($content, 'woocommerce-cart-fragment') !== false) return $content;
         if (stripos($content, 'cartflows') !== false || stripos($content, 'wcf-') !== false || stripos($content, 'data-cartflows') !== false) return $content;
         if (stripos($content, 'edd-cart') !== false) return $content;
-        if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar')) return $content;
+        if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar') !== false) return $content;
         if (strpos($content, '_wpnonce') !== false) return $content;
 
         $cache_file = $this->get_cache_file();
         $meta_file = $this->get_cache_meta();
-        $lock_file = $this->get_lock_file();
-
-        $lock = @fopen($lock_file, 'c');
-        if (false === $lock) {
-            $this->send_cache_headers(time(), false);
-            return $content . $this->get_cache_footer(time(), false);
-        }
-
-        if (!flock($lock, LOCK_EX | LOCK_NB)) {
-            fclose($lock);
-            $this->send_cache_headers(time(), false);
-            return $content . $this->get_cache_footer(time(), false);
-        }
-
         $cache_time = time();
+
         $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
 
         $meta = [
@@ -653,61 +536,14 @@ Deny from all
             'size' => strlen($content_with_footer),
         ];
 
-        $meta_temp = $meta_file . '.tmp';
-        if (false === @file_put_contents($meta_temp, json_encode($meta), LOCK_EX)) {
-            flock($lock, LOCK_UN);
-            fclose($lock);
-            @unlink($meta_temp);
-            $this->send_cache_headers(time(), false);
-            return $content_with_footer;
-        }
-        rename($meta_temp, $meta_file);
+        @file_put_contents($meta_file, json_encode($meta), LOCK_EX);
+        @file_put_contents($cache_file, $content_with_footer, LOCK_EX);
 
-        $cache_temp = $cache_file . '.tmp';
-        if (false === @file_put_contents($cache_temp, $content_with_footer, LOCK_EX)) {
-            flock($lock, LOCK_UN);
-            fclose($lock);
-            @unlink($cache_temp);
-            $this->send_cache_headers(time(), false);
-            return $content_with_footer;
-        }
-        rename($cache_temp, $cache_file);
+        header(self::HEADER_HIT . ': MISS');
+        header('Cache-Control: public, max-age=' . $this->ttl);
+        header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + $this->ttl));
 
-        if ($this->has_object_cache()) {
-            wp_cache_set($this->get_cache_key(), [
-                'content' => $content,
-                'time' => $cache_time,
-            ], self::CACHE_GROUP, $this->ttl);
-        }
-
-        flock($lock, LOCK_UN);
-        fclose($lock);
-        @unlink($lock_file);
-
-        $saved = true;
-        $this->send_cache_headers($cache_time, false);
         return $content_with_footer;
-    }
-
-    private function send_cache_headers(int $cache_time, bool $is_hit): void {
-        if (headers_sent()) return;
-
-        if ($is_hit) {
-            header(self::HEADER_HIT . ': HIT');
-            header('Age: ' . (time() - $cache_time));
-        } else {
-            header(self::HEADER_HIT . ': MISS');
-        }
-
-        if ($this->skip) {
-            header(self::HEADER_HIT . ': BYPASS');
-            header('Cache-Control: no-cache, must-revalidate, max-age=0');
-            return;
-        }
-
-        $max_age = max(0, $this->ttl - (time() - $cache_time));
-        header('Cache-Control: public, max-age=' . $max_age);
-        header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + $max_age));
     }
 
     private function send_bypass_header(): void {
@@ -717,18 +553,9 @@ Deny from all
     private function delete_cache_files(): void {
         @unlink($this->get_cache_file());
         @unlink($this->get_cache_meta());
-        @unlink($this->get_lock_file());
-
-        if ($this->has_object_cache()) {
-            wp_cache_delete($this->get_cache_key(), self::CACHE_GROUP);
-        }
     }
 
     public function clear_all_cache(): void {
-        if ($this->has_object_cache()) {
-            wp_cache_flush_group(self::CACHE_GROUP);
-        }
-
         if (!is_dir($this->cache_dir)) return;
 
         $iterator = new DirectoryIterator($this->cache_dir);
@@ -749,17 +576,8 @@ Deny from all
 
         $key = md5((is_ssl() ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? '') . $path);
 
-        $files = [
-            $this->cache_dir . $key . '.html',
-            $this->cache_dir . $key . '.json',
-            $this->cache_dir . $key . '.lock',
-        ];
-
-        foreach ($files as $file) @unlink($file);
-
-        if ($this->has_object_cache()) {
-            wp_cache_delete($key, self::CACHE_GROUP);
-        }
+        @unlink($this->cache_dir . $key . '.html');
+        @unlink($this->cache_dir . $key . '.json');
     }
 
     public function handle_post_save(int $post_id, WP_Post $post, bool $update): void {
@@ -814,7 +632,6 @@ Deny from all
             'newest_cache' => null,
             'cache_dir' => $this->cache_dir,
             'ttl' => $this->ttl,
-            'object_cache' => $this->has_object_cache(),
             'dynamic_pages' => count($this->dynamic_page_ids),
             'dynamic_patterns' => count($this->dynamic_patterns),
         ];
@@ -865,7 +682,6 @@ class Serverfreak_Cache_CLI {
         WP_CLI::line('Total Files: ' . number_format($stats['total_files']));
         WP_CLI::line('Total Size: ' . size_format($stats['total_size']));
         WP_CLI::line('TTL: ' . $stats['ttl'] . ' seconds');
-        WP_CLI::line('Object Cache: ' . ($stats['object_cache'] ? 'Yes' : 'No'));
         WP_CLI::line('Dynamic Pages: ' . $stats['dynamic_pages']);
         WP_CLI::line('Dynamic Patterns: ' . $stats['dynamic_patterns']);
 
