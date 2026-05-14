@@ -500,6 +500,9 @@ Deny from all
         $ttl_remaining = human_time_diff(time(), $cache_time + $this->ttl);
         $mode = $is_hit ? 'HIT' : 'MISS';
         $storage = $this->has_object_cache() ? 'Object+Filesystem' : 'Filesystem';
+        $key = $this->get_cache_key();
+        $file = basename($this->get_cache_file());
+        $file_exists = file_exists($this->get_cache_file()) ? 'yes' : 'no';
 
         return sprintf(
             "
@@ -509,12 +512,22 @@ Deny from all
   Cached: %s ago
   Expires in: %s
   Storage: %s
+  Key: %s
+  File: %s
+  FileExists: %s
+  Skip: %s
+  URI: %s
 -->
 ",
             $mode,
             $age,
             $ttl_remaining,
-            $storage
+            $storage,
+            $key,
+            $file,
+            $file_exists,
+            $this->skip ? 'true' : 'false',
+            $_SERVER['REQUEST_URI'] ?? 'none'
         );
     }
 
