@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Serverfreak Instant Cache
  * Description: Production-grade full-page cache with .htaccess rewrite. WooCommerce + CartFlows + multisite aware. Zero config.
- * Version: 3.0.1
+ * Version: 3.0.2
  * Author: Assistant
  * Network: true
  */
@@ -72,17 +72,28 @@ final class Serverfreak_Instant_Cache {
 
             $htaccess = $this->cache_dir . '.htaccess';
             if (!file_exists($htaccess)) {
-                @file_put_contents($htaccess, "Options -Indexes\n<<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n", LOCK_EX);
+                @file_put_contents($htaccess, "Options -Indexes
+<IfModule mod_authz_core.c>
+Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+Order deny,allow
+Deny from all
+</IfModule>
+", LOCK_EX);
             }
 
             $index = $this->cache_dir . 'index.php';
             if (!file_exists($index)) {
-                @file_put_contents($index, "<?php\n// Silence is golden\n", LOCK_EX);
+                @file_put_contents($index, "<?php
+// Silence is golden
+", LOCK_EX);
             }
 
             $nginx = $this->cache_dir . 'nginx.conf';
             if (!file_exists($nginx)) {
-                @file_put_contents($nginx, "deny all;\n", LOCK_EX);
+                @file_put_contents($nginx, "deny all;
+", LOCK_EX);
             }
         }
 
@@ -111,11 +122,13 @@ final class Serverfreak_Instant_Cache {
         add_action('switch_theme', [$this, 'clear_all_cache'], 10, 0);
         add_action('wp_trash_post', [$this, 'handle_post_trash'], 10, 1);
 
-        // .htaccess rewrite rules - try multiple methods
+        // .htaccess rewrite rules
         add_filter('mod_rewrite_rules', [$this, 'add_rewrite_rules'], PHP_INT_MAX);
-        
-        // Direct .htaccess write on activation and when needed
+
+        // Direct .htaccess write on activation
         add_action('activate_' . plugin_basename(__FILE__), [$this, 'write_htaccess_directly']);
+
+        // Check and write on wp_loaded if needed
         add_action('wp_loaded', [$this, 'maybe_write_htaccess'], PHP_INT_MAX);
 
         if (is_multisite()) {
@@ -131,12 +144,10 @@ final class Serverfreak_Instant_Cache {
      * Try to write .htaccess directly if WordPress hasn't done it
      */
     public function maybe_write_htaccess(): void {
-        // Only run once per request
         static $done = false;
         if ($done) return;
         $done = true;
 
-        // Check if our rules are already in .htaccess
         $htaccess_file = ABSPATH . '.htaccess';
         if (!file_exists($htaccess_file)) return;
 
@@ -145,7 +156,6 @@ final class Serverfreak_Instant_Cache {
 
         if (strpos($content, '# Serverfreak Instant Cache') !== false) return;
 
-        // Not there - try to add directly
         $this->write_htaccess_directly();
     }
 
@@ -154,40 +164,57 @@ final class Serverfreak_Instant_Cache {
      */
     public function write_htaccess_directly(): void {
         $htaccess_file = ABSPATH . '.htaccess';
-        
-        // Get the cache path relative to document root
+
         $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
         $cache_path = ltrim($cache_path, '/');
 
-        $rules = "\n";
-        $rules .= "# Serverfreak Instant Cache\n";
-        $rules .= "<<IfModule mod_rewrite.c>\n";
-        $rules .= "RewriteEngine On\n";
-        $rules .= "RewriteCond %{REQUEST_METHOD} GET\n";
-        $rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]\n";
-        $rules .= "RewriteCond %{QUERY_STRING} ^$\n";
-        $rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]\n";
-        $rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]\n";
-        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]\n";
-        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
-        $rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
-        $rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f\n";
-        $rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]\n";
-        $rules .= "<</IfModule>\n";
-        $rules .= "# /Serverfreak Instant Cache\n";
+        $rules = "
+";
+        $rules .= "# Serverfreak Instant Cache
+";
+        $rules .= "<IfModule mod_rewrite.c>
+";
+        $rules .= "RewriteEngine On
+";
+        $rules .= "RewriteCond %{REQUEST_METHOD} GET
+";
+        $rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]
+";
+        $rules .= "RewriteCond %{QUERY_STRING} ^$
+";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]
+";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]
+";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]
+";
+        $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]
+";
+        $rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]
+";
+        $rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f
+";
+        $rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]
+";
+        $rules .= "</IfModule>
+";
+        $rules .= "# /Serverfreak Instant Cache
+";
 
         if (file_exists($htaccess_file) && is_writable($htaccess_file)) {
             $content = file_get_contents($htaccess_file);
-            
+
             // Remove old rules if present
-            $content = preg_replace('/\n# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache\n/s', '', $content);
-            
+            $content = preg_replace('/
+# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache
+/s', '', $content);
+
             // Add before WordPress section
             $wp_begin = '# BEGIN WordPress';
             if (strpos($content, $wp_begin) !== false) {
                 $content = str_replace($wp_begin, $rules . $wp_begin, $content);
             } else {
-                $content .= $rules;
+                $content = $rules . $content;
             }
 
             @file_put_contents($htaccess_file, $content, LOCK_EX);
@@ -204,7 +231,9 @@ final class Serverfreak_Instant_Cache {
         $content = @file_get_contents($htaccess_file);
         if ($content === false) return;
 
-        $content = preg_replace('/\n# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache\n/s', '', $content);
+        $content = preg_replace('/
+# Serverfreak Instant Cache.*?# \/Serverfreak Instant Cache
+/s', '', $content);
         @file_put_contents($htaccess_file, $content, LOCK_EX);
     }
 
@@ -219,19 +248,32 @@ final class Serverfreak_Instant_Cache {
         $cache_path = str_replace(ABSPATH, '', $this->cache_dir);
         $cache_path = ltrim($cache_path, '/');
 
-        $new_rules = "\n";
-        $new_rules .= "# Serverfreak Instant Cache\n";
-        $new_rules .= "RewriteCond %{REQUEST_METHOD} GET\n";
-        $new_rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]\n";
-        $new_rules .= "RewriteCond %{QUERY_STRING} ^$\n";
-        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]\n";
-        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]\n";
-        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]\n";
-        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
-        $new_rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
-        $new_rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f\n";
-        $new_rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]\n";
-        $new_rules .= "# /Serverfreak Instant Cache\n";
+        $new_rules = "
+";
+        $new_rules .= "# Serverfreak Instant Cache
+";
+        $new_rules .= "RewriteCond %{REQUEST_METHOD} GET
+";
+        $new_rules .= "RewriteCond %{QUERY_STRING} ^(utm_source|utm_medium|utm_campaign|utm_term|utm_content|fbclid|gclid)= [NC,OR]
+";
+        $new_rules .= "RewriteCond %{QUERY_STRING} ^$
+";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wordpress_logged_in [NC]
+";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !wp_woocommerce_session [NC]
+";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_items_in_cart [NC]
+";
+        $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]
+";
+        $new_rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]
+";
+        $new_rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html -f
+";
+        $new_rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html [L]
+";
+        $new_rules .= "# /Serverfreak Instant Cache
+";
 
         return $new_rules . $rules;
     }
@@ -460,7 +502,15 @@ final class Serverfreak_Instant_Cache {
         $storage = $this->has_object_cache() ? 'Object+Filesystem' : 'Filesystem';
 
         return sprintf(
-            "\n<!--\n  Serverfreak Instant Cache\n  Status: %s\n  Cached: %s ago\n  Expires in: %s\n  Storage: %s\n-->\n",
+            "
+<!--
+  Serverfreak Instant Cache
+  Status: %s
+  Cached: %s ago
+  Expires in: %s
+  Storage: %s
+-->
+",
             $mode,
             $age,
             $ttl_remaining,
@@ -543,7 +593,7 @@ final class Serverfreak_Instant_Cache {
         if (stripos($content, 'cartflows') !== false || stripos($content, 'wcf-') !== false || stripos($content, 'data-cartflows') !== false) return $content;
         if (stripos($content, 'edd-cart') !== false) return $content;
         if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar')) return $content;
-        if (preg_match('/<<input[^>]*name=["\']_wpnonce["\'][^>]*>/i', $content)) return $content;
+        if (preg_match('/<input[^>]*name=["']_wpnonce["'][^>]*>/i', $content)) return $content;
 
         $cache_file = $this->get_cache_file();
         $meta_file = $this->get_cache_meta();
@@ -744,7 +794,7 @@ final class Serverfreak_Instant_Cache {
                 $stats['total_files']++;
                 $stats['total_size'] += $file->getSize();
                 $mtime = $file->getMTime();
-                
+
                 if (null === $stats['oldest_cache'] || $mtime < $stats['oldest_cache']) {
                     $stats['oldest_cache'] = $mtime;
                 }
