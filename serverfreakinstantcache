@@ -455,20 +455,17 @@ Deny from all
 
         $age = human_time_diff($cache_time, time());
         $ttl_remaining = human_time_diff(time(), $cache_time + $this->ttl);
-        $mode = $is_hit ? 'HIT' : 'MISS';
         $storage = wp_using_ext_object_cache() ? 'Object+Filesystem' : 'Filesystem';
 
         return sprintf(
             "
 <!--
   Serverfreak Instant Cache
-  Status: %s
   Cached: %s ago
   Expires in: %s
   Storage: %s
 -->
 ",
-            $mode,
             $age,
             $ttl_remaining,
             $storage
@@ -505,6 +502,9 @@ Deny from all
         header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + max(0, $this->ttl - $age)));
 
         readfile($cache_file);
+        echo "
+<!--  Served from cache -->
+";
         exit;
     }
 
