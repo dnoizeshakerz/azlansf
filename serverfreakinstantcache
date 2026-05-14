@@ -138,7 +138,17 @@ Deny from all
         $done = true;
 
         $htaccess_file = ABSPATH . '.htaccess';
-        if (!file_exists($htaccess_file)) return;
+
+        // If .htaccess doesn't exist, try to create it
+        if (!file_exists($htaccess_file)) {
+            if (is_writable(ABSPATH)) {
+                @file_put_contents($htaccess_file, "# BEGIN WordPress
+# END WordPress
+");
+            } else {
+                return;
+            }
+        }
 
         $content = @file_get_contents($htaccess_file);
         if ($content === false) return;
@@ -253,6 +263,12 @@ Deny from all
     }
 
     public function late_init(): void {
+        // Manual trigger to rewrite .htaccess via URL: ?sic_rewrite=1
+        if (isset($_GET['sic_rewrite']) && current_user_can('manage_options')) {
+            $this->write_htaccess_directly();
+            wp_die('Serverfreak Cache: .htaccess rewrite rules updated. <a href="' . home_url() . '">Go home</a>');
+        }
+
         if ($this->should_skip_logged_in()) {
             $this->skip = true;
             $this->send_bypass_header();
