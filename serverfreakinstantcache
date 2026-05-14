@@ -593,7 +593,7 @@ Deny from all
         if (stripos($content, 'cartflows') !== false || stripos($content, 'wcf-') !== false || stripos($content, 'data-cartflows') !== false) return $content;
         if (stripos($content, 'edd-cart') !== false) return $content;
         if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar')) return $content;
-        if (preg_match("/<input[^>]*name=['"]_wpnonce['"][^>]*>/i", $content)) return $content;
+        if (strpos($content, '_wpnonce') !== false) return $content;
 
         $cache_file = $this->get_cache_file();
         $meta_file = $this->get_cache_meta();
