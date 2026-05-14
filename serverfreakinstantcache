@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Serverfreak Instant Cache
  * Description: Ultra-fast full-page caching with gzip, preloading, and cache health warnings. Drop into wp-content/mu-plugins/.
- * Version: 2.0.0-mu
+ * Version: 2.0.1-mu
  * Author: Serverfreak
  * Requires PHP: 7.4
  */
@@ -77,10 +77,7 @@ class Serverfreak_Instant_Cache {
     }
 
     private function register_hooks(): void {
-        // MU plugin: no activation hook, so write htaccess on init if needed
         add_action('muplugins_loaded', [$this, 'maybe_write_htaccess'], 20);
-        
-        // Also hook into regular init for late checks
         add_action('init', [$this, 'maybe_write_htaccess'], 1);
 
         if ($this->early_bail_check_safe()) {
@@ -100,13 +97,10 @@ class Serverfreak_Instant_Cache {
 
         add_filter('mod_rewrite_rules', [$this, 'add_rewrite_rules'], PHP_INT_MAX);
 
-        // === PRELOAD: Trigger after clears ===
         add_action('serverfreak_cache_cleared', [$this, 'schedule_preload'], 10, 0);
         add_action('serverfreak_run_preload', [$this, 'run_preload_batch'], 10, 1);
 
-        // === CACHE WARN: Admin notices (MU-safe) ===
         add_action('admin_notices', [$this, 'show_cache_warnings']);
-        // Also show on network admin for multisite
         add_action('network_admin_notices', [$this, 'show_cache_warnings']);
 
         if (is_multisite()) {
@@ -141,9 +135,7 @@ class Serverfreak_Instant_Cache {
         if ($screen && $screen->is_block_editor()) return;
 
         $warnings = [];
-        $notices = [];
 
-        // Check cache directory writable
         if (!is_writable($this->cache_dir)) {
             $warnings[] = sprintf(
                 '<strong>Serverfreak Cache Warning:</strong> Cache directory is not writable: <code>%s</code>. Caching is disabled.',
@@ -151,24 +143,21 @@ class Serverfreak_Instant_Cache {
             );
         }
 
-        // Check .htaccess rules present
         $htaccess_file = ABSPATH . '.htaccess';
         if (file_exists($htaccess_file) && is_readable($htaccess_file)) {
             $content = @file_get_contents($htaccess_file);
             if ($content === false || strpos($content, '# Serverfreak Instant Cache') === false) {
                 $fix_url = wp_nonce_url(admin_url('?sic_rewrite=1'), 'sic_rewrite');
-                $warnings[] = '<strong>Serverfreak Cache Warning:</strong> Rewrite rules missing from <code>.htaccess</code>. <a href="' . esc_url($fix_url) . '">Click here to fix</a> or <a href="https://github.com/dnoizeshakerz/azlansf/wiki/Manual-htaccess" target="_blank">add manually</a>.';
+                $warnings[] = '<strong>Serverfreak Cache Warning:</strong> Rewrite rules missing from <code>.htaccess</code>. <a href="' . esc_url($fix_url) . '">Click here to fix</a>.';
             }
         } elseif (!is_writable(ABSPATH)) {
             $warnings[] = '<strong>Serverfreak Cache Warning:</strong> Cannot create <code>.htaccess</code>. Please ensure the WordPress root directory is writable or add rules manually.';
         }
 
-        // Check gzip support availability
         if (!function_exists('gzencode')) {
             $warnings[] = '<strong>Serverfreak Cache Warning:</strong> PHP <code>zlib</code> extension is not available. Gzip compression is disabled.';
         }
 
-        // Check disk space (warn if < 100MB)
         $free_space = @disk_free_space($this->cache_dir);
         if ($free_space !== false && $free_space < 100 * 1024 * 1024) {
             $warnings[] = sprintf(
@@ -177,7 +166,6 @@ class Serverfreak_Instant_Cache {
             );
         }
 
-        // Display warnings
         foreach ($warnings as $warning) {
             printf(
                 '<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
@@ -185,7 +173,6 @@ class Serverfreak_Instant_Cache {
             );
         }
 
-        // Show success if everything is OK
         if (empty($warnings)) {
             $stats = $this->get_stats();
             $gzip_status = function_exists('gzencode') ? 'Enabled' : 'Disabled';
@@ -204,16 +191,13 @@ class Serverfreak_Instant_Cache {
     // ==================== PRELOAD FEATURE ====================
 
     public function schedule_preload(): void {
-        // Clear existing preload hooks to avoid duplicates
         wp_clear_scheduled_hook('serverfreak_run_preload');
 
         $urls = $this->get_preload_urls();
         if (empty($urls)) return;
 
-        // Schedule first batch immediately
         wp_schedule_single_event(time(), 'serverfreak_run_preload', [array_slice($urls, 0, self::PRELOAD_BATCH)]);
         
-        // Schedule remaining batches with delay
         $remaining = array_slice($urls, self::PRELOAD_BATCH);
         $delay = self::PRELOAD_DELAY;
         while (!empty($remaining)) {
@@ -226,11 +210,8 @@ class Serverfreak_Instant_Cache {
 
     private function get_preload_urls(): array {
         $urls = [];
-
-        // Homepage
         $urls[] = home_url('/');
 
-        // Recent posts (last 10)
         $recent_posts = get_posts([
             'posts_per_page' => 10,
             'post_status'    => 'publish',
@@ -241,7 +222,6 @@ class Serverfreak_Instant_Cache {
             $urls[] = get_permalink($post_id);
         }
 
-        // Key pages
         $key_pages = [
             get_option('page_for_posts'),
             get_option('woocommerce_shop_page_id'),
@@ -254,7 +234,6 @@ class Serverfreak_Instant_Cache {
             }
         }
 
-        // Popular categories
         $categories = get_terms([
             'taxonomy'   => 'category',
             'hide_empty' => true,
@@ -300,7 +279,6 @@ class Serverfreak_Instant_Cache {
         if ($done) return;
         $done = true;
 
-        // MU plugin: also handle manual trigger via URL
         if (isset($_GET['sic_rewrite']) && current_user_can('manage_options')) {
             check_admin_referer('sic_rewrite');
             $this->write_htaccess_directly();
@@ -343,7 +321,6 @@ class Serverfreak_Instant_Cache {
         $rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
         $rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
         
-        // GZIP: Check for .html.gz first, fallback to .html
         $rules .= "RewriteCond %{HTTP:Accept-Encoding} gzip\n";
         $rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html.gz -f\n";
         $rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html.gz [L,E=no-gzip:1]\n";
@@ -397,7 +374,6 @@ class Serverfreak_Instant_Cache {
         $new_rules .= "RewriteCond %{HTTP_COOKIE} !woocommerce_cart_hash [NC]\n";
         $new_rules .= "RewriteCond %{REQUEST_URI} !^/(wp-admin|wp-login|wp-content|wp-includes|cart|checkout|my-account|wc-api|wc-ajax|cartflows|edd-sl|members|groups|forums|topic|reply) [NC]\n";
         
-        // GZIP: Check for .html.gz first, fallback to .html
         $new_rules .= "RewriteCond %{HTTP:Accept-Encoding} gzip\n";
         $new_rules .= "RewriteCond %{DOCUMENT_ROOT}/" . $cache_path . "%{REQUEST_URI}.html.gz -f\n";
         $new_rules .= "RewriteRule ^(.*)$ /" . $cache_path . "%{REQUEST_URI}.html.gz [L,E=no-gzip:1]\n";
@@ -612,25 +588,34 @@ class Serverfreak_Instant_Cache {
         return $this->cache_dir . $this->get_cache_key() . '.json';
     }
 
+    /**
+     * Generate cache footer HTML comment - bulletproof version
+     */
     private function get_cache_footer(int $cache_time, bool $is_hit): string {
-        if (!apply_filters('serverfreak_cache_show_footer', true)) return '';
+        if (!apply_filters('serverfreak_cache_show_footer', true)) {
+            return '';
+        }
 
         $age = human_time_diff($cache_time, time());
         $ttl_remaining = human_time_diff(time(), $cache_time + $this->ttl);
         $storage = wp_using_ext_object_cache() ? 'Object+Filesystem' : 'Filesystem';
-        $gzip = function_exists('gzencode') ? 'Gzip' : 'Plain';
+        $compression = function_exists('gzencode') ? 'Gzip' : 'Plain';
+        $status = $is_hit ? 'HIT' : 'MISS';
 
-        return sprintf(
-            "\n<!-- Cached by Serverfreak Instant Cache | Age: %s | TTL Left: %s | Storage: %s | Compression: %s -->",
-            $age,
-            $ttl_remaining,
-            $storage,
-            $gzip
-        );
+        // Build footer with explicit concatenation (avoid sprintf format string issues)
+        $footer = "\n<!-- ";
+        $footer .= "Serverfreak Cache | Status: " . $status;
+        $footer .= " | Age: " . $age;
+        $footer .= " | TTL Left: " . $ttl_remaining;
+        $footer .= " | Storage: " . $storage;
+        $footer .= " | Compression: " . $compression;
+        $footer .= " -->";
+
+        return apply_filters('serverfreak_cache_footer_html', $footer, $cache_time, $is_hit, $this);
     }
 
     /**
-     * Serve cached file - with Gzip support
+     * Serve cached file - with Gzip support and footer verification
      */
     public function try_serve_cache(): void {
         if ($this->skip) return;
@@ -640,10 +625,8 @@ class Serverfreak_Instant_Cache {
         $use_gzip = false;
         $serve_file = $cache_file;
 
-        // Check if browser accepts gzip
         $accepts_gzip = isset($_SERVER['HTTP_ACCEPT_ENCODING']) && stripos($_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip') !== false;
 
-        // Prefer .html.gz if browser supports it and file exists
         if ($accepts_gzip && file_exists($gzip_file)) {
             $serve_file = $gzip_file;
             $use_gzip = true;
@@ -660,14 +643,13 @@ class Serverfreak_Instant_Cache {
         }
 
         $file_size = filesize($serve_file);
-        if (false === $file_size || $file_size > self::MAX_FILE_SIZE) {
+        if (false === $file_size || $file_size > self::MAX_FILE_SIZE || $file_size === 0) {
             unlink($serve_file);
             @unlink($use_gzip ? $cache_file : $gzip_file);
             @unlink($this->get_cache_meta());
             return;
         }
 
-        // Set headers
         header(self::HEADER_HIT . ': HIT');
         header(self::HEADER_GZIP . ': ' . ($use_gzip ? 'YES' : 'NO'));
         header('Age: ' . $age);
@@ -680,6 +662,15 @@ class Serverfreak_Instant_Cache {
         }
 
         readfile($serve_file);
+        
+        // Safety net: if plain HTML file is missing footer, append it now
+        if (!$use_gzip) {
+            $last_bytes = @file_get_contents($serve_file, false, null, max(0, $file_size - 200));
+            if ($last_bytes !== false && strpos($last_bytes, '<!-- Serverfreak Cache') === false) {
+                echo $this->get_cache_footer(filemtime($serve_file), true);
+            }
+        }
+        
         echo "\n";
         exit;
     }
@@ -690,41 +681,52 @@ class Serverfreak_Instant_Cache {
     }
 
     /**
-     * Save cache - with optional Gzip compression
+     * Save cache - with guaranteed footer and gzip
      */
     public function save_cache(string $content): string {
         if ($this->skip || empty($content)) return $content;
-        if (http_response_code() !== 200) return $content;
+        
+        $response_code = http_response_code();
+        if ($response_code !== 200) return $content;
 
-        if (stripos($content, '<form') !== false) return $content;
-        if (stripos($content, 'wc_fragments') !== false || stripos($content, 'woocommerce-cart-fragment') !== false) return $content;
-        if (stripos($content, 'cartflows') !== false || stripos($content, 'wcf-') !== false || stripos($content, 'data-cartflows') !== false) return $content;
-        if (stripos($content, 'edd-cart') !== false) return $content;
-        if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar') !== false) return $content;
-        if (strpos($content, '_wpnonce') !== false) return $content;
+        $skip_markers = [
+            '<form', 'wc_fragments', 'woocommerce-cart-fragment',
+            'cartflows', 'wcf-', 'data-cartflows', 'edd-cart',
+            'wpadminbar', 'admin-bar', '_wpnonce',
+        ];
+        
+        foreach ($skip_markers as $marker) {
+            if (stripos($content, $marker) !== false) return $content;
+        }
 
         $cache_file = $this->get_cache_file();
         $gzip_file = $this->get_cache_gzip_file();
         $meta_file = $this->get_cache_meta();
         $cache_time = time();
 
-        $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
+        $footer = $this->get_cache_footer($cache_time, false);
+        $content_with_footer = $content . $footer;
 
         $meta = [
             'time' => $cache_time,
             'uri' => $_SERVER['REQUEST_URI'] ?? '/',
             'size' => strlen($content_with_footer),
             'gzip' => false,
+            'footer' => !empty($footer),
         ];
 
-        // Save plain HTML
-        @file_put_contents($meta_file, json_encode($meta), LOCK_EX);
-        @file_put_contents($cache_file, $content_with_footer, LOCK_EX);
+        $html_saved = @file_put_contents($cache_file, $content_with_footer, LOCK_EX);
+        
+        if ($html_saved === false) {
+            error_log('Serverfreak Cache: Failed to write cache file: ' . $cache_file);
+            return $content;
+        }
 
-        // GZIP: Also save compressed version if zlib available
+        @file_put_contents($meta_file, json_encode($meta), LOCK_EX);
+
         if (function_exists('gzencode')) {
             $gzipped = gzencode($content_with_footer, 9);
-            if ($gzipped !== false) {
+            if ($gzipped !== false && strlen($gzipped) > 0) {
                 @file_put_contents($gzip_file, $gzipped, LOCK_EX);
                 $meta['gzip'] = true;
                 $meta['gzip_size'] = strlen($gzipped);
@@ -732,9 +734,11 @@ class Serverfreak_Instant_Cache {
             }
         }
 
-        header(self::HEADER_HIT . ': MISS');
-        header('Cache-Control: public, max-age=' . $this->ttl);
-        header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + $this->ttl));
+        if (!headers_sent()) {
+            header(self::HEADER_HIT . ': MISS');
+            header('Cache-Control: public, max-age=' . $this->ttl);
+            header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + $this->ttl));
+        }
 
         return $content_with_footer;
     }
@@ -762,7 +766,6 @@ class Serverfreak_Instant_Cache {
             }
         }
 
-        // Trigger preload after clearing
         do_action('serverfreak_cache_cleared');
     }
 
@@ -933,5 +936,4 @@ class Serverfreak_Cache_CLI {
     }
 }
 
-// Initialize immediately (MU plugins load before regular plugins)
 Serverfreak_Instant_Cache::instance();
