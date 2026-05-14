@@ -1,0 +1,861 @@
+<?php
+/**
+ * Plugin Name: Serverfreak Instant Cache
+ * Description: Production-grade full-page cache. WooCommerce + CartFlows + multisite aware. Zero config.
+ * Version: 2.0.4
+ * Author: Assistant
+ * Network: true
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Serverfreak Instant Cache
+ */
+final class Serverfreak_Instant_Cache {
+
+    private static ?self $instance = null;
+    private string $cache_dir;
+    private int $ttl;
+    private bool $skip = false;
+    private ?string $cache_key = null;
+    private array $dynamic_page_ids = [];
+    private array $dynamic_patterns = [];
+    private ?bool $has_object_cache = null;
+    private bool $dynamic_pages_built = false;
+
+    private const CACHE_GROUP = 'serverfreak_cache';
+    private const HEADER_HIT = 'X-Cache-Status';
+    private const MAX_FILE_SIZE = 10485760;
+
+    public static function instance(): self {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function __construct() {
+        $this->ttl = (int) apply_filters('serverfreak_cache_ttl', 3600);
+        $this->setup_cache_directory();
+        $this->register_hooks();
+    }
+
+    private function __clone() {}
+
+    /**
+     * Lazy object cache check — handles null return from wp_using_ext_object_cache()
+     */
+    private function has_object_cache(): bool {
+        if (null === $this->has_object_cache) {
+            // wp_using_ext_object_cache() can return null before object cache is loaded
+            $status = wp_using_ext_object_cache();
+            $this->has_object_cache = ($status === true);
+        }
+        return $this->has_object_cache;
+    }
+
+    private function setup_cache_directory(): void {
+        $base_dir = WP_CONTENT_DIR . '/cache/serverfreak-cache/';
+
+        if (is_multisite()) {
+            $blog_id = get_current_blog_id();
+            $this->cache_dir = $base_dir . 'site-' . $blog_id . '/';
+        } else {
+            $this->cache_dir = $base_dir . 'default/';
+        }
+
+        if (!is_dir($this->cache_dir)) {
+            wp_mkdir_p($this->cache_dir);
+
+            $htaccess = $this->cache_dir . '.htaccess';
+            if (!file_exists($htaccess)) {
+                @file_put_contents($htaccess, "Options -Indexes\n<<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n", LOCK_EX);
+            }
+
+            $index = $this->cache_dir . 'index.php';
+            if (!file_exists($index)) {
+                @file_put_contents($index, "<?php\n// Silence is golden\n", LOCK_EX);
+            }
+
+            $nginx = $this->cache_dir . 'nginx.conf';
+            if (!file_exists($nginx)) {
+                @file_put_contents($nginx, "deny all;\n", LOCK_EX);
+            }
+        }
+
+        if (!is_writable($this->cache_dir)) {
+            $this->skip = true;
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log('Serverfreak Cache: Cache directory not writable: ' . $this->cache_dir);
+            }
+        }
+    }
+
+    private function register_hooks(): void {
+        if ($this->early_bail_check_safe()) {
+            $this->skip = true;
+            return;
+        }
+
+        add_action('wp', [$this, 'late_init'], PHP_INT_MIN);
+
+        add_action('save_post', [$this, 'handle_post_save'], 10, 3);
+        add_action('woocommerce_order_status_changed', [$this, 'clear_all_cache'], 10, 0);
+        add_action('cartflows_order_status_changed', [$this, 'clear_all_cache'], 10, 0);
+        add_action('cartflows_step_saved', [$this, 'clear_all_cache'], 10, 0);
+        add_action('upgrader_process_complete', [$this, 'clear_all_cache'], 10, 0);
+        add_action('switch_theme', [$this, 'clear_all_cache'], 10, 0);
+        add_action('wp_trash_post', [$this, 'handle_post_trash'], 10, 1);
+
+        if (is_multisite()) {
+            add_action('wp_uninitialize_blog', [$this, 'handle_blog_delete'], 10, 1);
+        }
+
+        if (defined('WP_CLI') && WP_CLI) {
+            add_action('cli_init', [$this, 'register_cli_commands']);
+        }
+    }
+
+    private function early_bail_check_safe(): bool {
+        if (is_admin()) {
+            return true;
+        }
+
+        if (defined('DOING_AJAX') && DOING_AJAX) {
+            return true;
+        }
+
+        if (defined('DOING_CRON') && DOING_CRON) {
+            return true;
+        }
+
+        if (defined('REST_REQUEST') && REST_REQUEST) {
+            return true;
+        }
+
+        if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) {
+            return true;
+        }
+
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+            return true;
+        }
+
+        if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'robots.txt') !== false) {
+            return true;
+        }
+
+        if (isset($_SERVER['REQUEST_URI']) && preg_match('/sitemap.*\.xml$/i', $_SERVER['REQUEST_URI'])) {
+            return true;
+        }
+
+        if (isset($_GET['preview']) || isset($_GET['preview_id'])) {
+            return true;
+        }
+
+        if (!empty($_SERVER['HTTP_REFERER']) && stripos($_SERVER['HTTP_REFERER'], 'trackback') !== false) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public function late_init(): void {
+        if ($this->should_skip_logged_in()) {
+            $this->skip = true;
+            $this->send_bypass_header();
+            return;
+        }
+
+        $this->build_dynamic_page_list();
+
+        if ($this->should_skip_dynamic_pages()) {
+            $this->skip = true;
+            $this->send_bypass_header();
+            return;
+        }
+
+        add_action('template_redirect', [$this, 'try_serve_cache'], PHP_INT_MIN);
+        add_action('template_redirect', [$this, 'start_capture'], PHP_INT_MAX);
+    }
+
+    private function should_skip_logged_in(): bool {
+        if ($this->skip) {
+            return true;
+        }
+
+        if (is_customize_preview()) {
+            return true;
+        }
+
+        if (post_password_required()) {
+            return true;
+        }
+
+        if (apply_filters('serverfreak_cache_skip_logged_in', is_user_logged_in())) {
+            return true;
+        }
+
+        if (is_feed()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function build_dynamic_page_list(): void {
+        if ($this->dynamic_pages_built) {
+            return;
+        }
+
+        $this->dynamic_page_ids = [];
+        $this->dynamic_patterns = [];
+
+        if (function_exists('WC') || class_exists('WooCommerce')) {
+            $wc_pages = [
+                'woocommerce_cart_page_id',
+                'woocommerce_checkout_page_id',
+                'woocommerce_myaccount_page_id',
+                'woocommerce_terms_page_id',
+            ];
+
+            foreach ($wc_pages as $option) {
+                $page_id = (int) get_option($option, 0);
+                if ($page_id > 0) {
+                    $this->dynamic_page_ids[] = $page_id;
+                }
+            }
+
+            $this->dynamic_patterns[] = '/wc-api/';
+            $this->dynamic_patterns[] = '/wc-ajax/';
+        }
+
+        if (function_exists('cartflows') || class_exists('Cartflows_Loader') || class_exists('Cartflows_Admin')) {
+            if (function_exists('cartflows_get_global_checkout_id')) {
+                $global = (int) cartflows_get_global_checkout_id();
+                if ($global > 0) {
+                    $this->dynamic_page_ids[] = $global;
+                }
+            }
+
+            $cf_posts = get_posts([
+                'post_type'      => ['cartflows_flow', 'cartflows_step', 'cartflows_checkout', 'cartflows_thankyou', 'cartflows_upsell', 'cartflows_downsell'],
+                'post_status'    => 'publish',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+                'suppress_filters' => false,
+            ]);
+
+            if (!empty($cf_posts) && !is_wp_error($cf_posts)) {
+                foreach ($cf_posts as $post_id) {
+                    $this->dynamic_page_ids[] = (int) $post_id;
+                }
+            }
+
+            $this->dynamic_patterns[] = '/cartflows';
+            $this->dynamic_patterns[] = '/checkout-2/';
+            $this->dynamic_patterns[] = '/cf-checkout/';
+            $this->dynamic_patterns[] = 'wcf-step=';
+            $this->dynamic_patterns[] = 'cartflows_step=';
+            $this->dynamic_patterns[] = 'wcf_checkout_id=';
+            $this->dynamic_patterns[] = 'wcf_order=';
+            $this->dynamic_patterns[] = 'wcf-';
+        }
+
+        if (class_exists('Easy_Digital_Downloads')) {
+            $this->dynamic_patterns[] = '/edd-sl/';
+            $this->dynamic_patterns[] = 'edd_action=';
+        }
+
+        if (class_exists('MeprUser')) {
+            $this->dynamic_patterns[] = '/account/';
+            $this->dynamic_patterns[] = '/login/';
+        }
+
+        if (class_exists('SFWD_LMS') || class_exists('LifterLMS')) {
+            $this->dynamic_patterns[] = '/courses/';
+            $this->dynamic_patterns[] = '/lesson/';
+        }
+
+        if (function_exists('bp_core_get_directory_pages')) {
+            $bp_pages = bp_core_get_directory_pages();
+            if (!empty($bp_pages)) {
+                foreach ($bp_pages as $component => $page) {
+                    if (!empty($page->id)) {
+                        $this->dynamic_page_ids[] = (int) $page->id;
+                    }
+                }
+            }
+            $this->dynamic_patterns[] = '/members/';
+            $this->dynamic_patterns[] = '/groups/';
+        }
+
+        if (class_exists('bbPress')) {
+            $this->dynamic_patterns[] = '/forums/';
+            $this->dynamic_patterns[] = '/topic/';
+            $this->dynamic_patterns[] = '/reply/';
+        }
+
+        $this->dynamic_page_ids = array_unique(array_map('intval', apply_filters('serverfreak_cache_dynamic_page_ids', $this->dynamic_page_ids)));
+        $this->dynamic_patterns = array_unique(apply_filters('serverfreak_cache_dynamic_patterns', $this->dynamic_patterns));
+        $this->dynamic_pages_built = true;
+    }
+
+    private function should_skip_dynamic_pages(): bool {
+        $uri = $_SERVER['REQUEST_URI'] ?? '/';
+
+        $safe_params = [
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+            'utm_id', 'utm_source_platform', 'utm_creative_format', 'utm_marketing_tactic',
+            'fbclid', 'gclid', 'dclid', 'twclid', 'li_fat_id',
+            'wbraid', 'gbraid', 'srsltid', 'irclickid', 'mc_cid', 'mc_eid',
+        ];
+
+        if (!empty($_GET)) {
+            $keys = array_keys($_GET);
+            $unsafe = array_diff($keys, $safe_params);
+
+            $pagination_params = ['paged', 'page', 'product-page', 'cpage'];
+            $unsafe = array_diff($unsafe, $pagination_params);
+
+            if (!empty($unsafe)) {
+                return true;
+            }
+        }
+
+        $wc_cookies = [
+            'woocommerce_items_in_cart',
+            'woocommerce_cart_hash',
+            'wp_woocommerce_session_',
+            'woocommerce_recently_viewed',
+        ];
+
+        foreach ($wc_cookies as $cookie_name) {
+            if (!empty($_COOKIE)) {
+                foreach ($_COOKIE as $key => $value) {
+                    if (stripos($key, $cookie_name) !== false) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (isset($_SERVER['HTTP_REFERER']) && stripos($_SERVER['HTTP_REFERER'], 'wc-ajax') !== false) {
+            return true;
+        }
+
+        $current_id = get_queried_object_id();
+        if ($current_id > 0 && in_array($current_id, $this->dynamic_page_ids, true)) {
+            return true;
+        }
+
+        global $post;
+        if ($post instanceof WP_Post && in_array((int) $post->ID, $this->dynamic_page_ids, true)) {
+            return true;
+        }
+
+        foreach ($this->dynamic_patterns as $pattern) {
+            if (stripos($uri, $pattern) !== false) {
+                return true;
+            }
+        }
+
+        if (function_exists('is_cart') && is_cart()) {
+            return true;
+        }
+        if (function_exists('is_checkout') && is_checkout()) {
+            return true;
+        }
+        if (function_exists('is_account_page') && is_account_page()) {
+            return true;
+        }
+        if (function_exists('is_wc_endpoint_url') && is_wc_endpoint_url()) {
+            return true;
+        }
+        if (function_exists('is_add_payment_method_page') && is_add_payment_method_page()) {
+            return true;
+        }
+        if (function_exists('is_edit_account_page') && is_edit_account_page()) {
+            return true;
+        }
+
+        if (function_exists('wcf_get_page_id') && wcf_get_page_id()) {
+            return true;
+        }
+
+        if (function_exists('wc') && WC() && WC()->session) {
+            $notices = WC()->session->get('wc_notices', []);
+            if (!empty($notices)) {
+                return true;
+            }
+        }
+
+        if (function_exists('edd_get_cart_contents') && !empty(edd_get_cart_contents())) {
+            return true;
+        }
+
+        if (is_author()) {
+            return true;
+        }
+
+        if (is_search()) {
+            return true;
+        }
+
+        if (is_404()) {
+            $this->ttl = (int) apply_filters('serverfreak_cache_404_ttl', 60);
+        }
+
+        return (bool) apply_filters('serverfreak_cache_should_skip', false, $uri, $this);
+    }
+
+    private function get_cache_key(): string {
+        if (null !== $this->cache_key) {
+            return $this->cache_key;
+        }
+
+        $uri = $_SERVER['REQUEST_URI'] ?? '/';
+
+        $safe_params = [
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+            'fbclid', 'gclid', 'dclid', 'twclid', 'li_fat_id',
+        ];
+        $uri = remove_query_arg($safe_params, $uri);
+
+        $device = '';
+        if (apply_filters('serverfreak_cache_separate_mobile', false)) {
+            if (wp_is_mobile()) {
+                $device = '_mobile';
+            } else {
+                $device = '_desktop';
+            }
+        }
+
+        $scheme = is_ssl() ? 'https' : 'http';
+
+        $variant = '';
+        if (isset($_SERVER['HTTP_ACCEPT']) && stripos($_SERVER['HTTP_ACCEPT'], 'image/webp') !== false) {
+            $variant .= '_webp';
+        }
+
+        $this->cache_key = md5($scheme . '://' . ($_SERVER['HTTP_HOST'] ?? '') . $uri . $device . $variant);
+
+        return $this->cache_key;
+    }
+
+    private function get_cache_file(): string {
+        return $this->cache_dir . $this->get_cache_key() . '.html';
+    }
+
+    private function get_cache_meta(): string {
+        return $this->cache_dir . $this->get_cache_key() . '.json';
+    }
+
+    private function get_lock_file(): string {
+        return $this->cache_dir . $this->get_cache_key() . '.lock';
+    }
+
+    public function try_serve_cache(): void {
+        if ($this->skip) {
+            return;
+        }
+
+        $cache_file = $this->get_cache_file();
+        $meta_file = $this->get_cache_meta();
+
+        if ($this->has_object_cache()) {
+            $cached = wp_cache_get($this->get_cache_key(), self::CACHE_GROUP);
+            if (is_array($cached) && !empty($cached['content']) && (time() - $cached['time']) < $this->ttl) {
+                $this->send_cache_headers($cached['time'], true);
+                echo $cached['content'];
+                exit;
+            }
+        }
+
+        if (!is_readable($cache_file) || !is_readable($meta_file)) {
+            return;
+        }
+
+        $meta_content = @file_get_contents($meta_file);
+        if (false === $meta_content) {
+            return;
+        }
+
+        $meta = json_decode($meta_content, true);
+        if (!is_array($meta) || empty($meta['time']) || !is_int($meta['time'])) {
+            $this->delete_cache_files();
+            return;
+        }
+
+        if ((time() - $meta['time']) > $this->ttl) {
+            $this->delete_cache_files();
+            return;
+        }
+
+        $file_size = filesize($cache_file);
+        if (false === $file_size || $file_size > self::MAX_FILE_SIZE) {
+            $this->delete_cache_files();
+            return;
+        }
+
+        $content = @file_get_contents($cache_file);
+        if (false === $content || empty($content)) {
+            $this->delete_cache_files();
+            return;
+        }
+
+        if (!empty($meta['hash'])) {
+            if (hash('sha256', $content) !== $meta['hash']) {
+                $this->delete_cache_files();
+                return;
+            }
+        }
+
+        $this->send_cache_headers($meta['time'], true);
+
+        if ($this->has_object_cache()) {
+            wp_cache_set($this->get_cache_key(), [
+                'content' => $content,
+                'time'    => $meta['time'],
+            ], self::CACHE_GROUP, $this->ttl);
+        }
+
+        echo $content;
+        exit;
+    }
+
+    public function start_capture(): void {
+        if ($this->skip) {
+            return;
+        }
+
+        ob_start([$this, 'save_cache']);
+    }
+
+    public function save_cache(string $content): string {
+        if ($this->skip || empty($content)) {
+            return $content;
+        }
+
+        if (http_response_code() !== 200) {
+            return $content;
+        }
+
+        if (stripos($content, '<!--nocache-->') !== false) {
+            return $content;
+        }
+
+        if (stripos($content, 'wc_fragments') !== false || stripos($content, 'woocommerce-cart-fragment') !== false) {
+            return $content;
+        }
+
+        if (stripos($content, 'cartflows') !== false || stripos($content, 'wcf-') !== false || stripos($content, 'data-cartflows') !== false) {
+            return $content;
+        }
+
+        if (stripos($content, 'edd-cart') !== false) {
+            return $content;
+        }
+
+        if (stripos($content, 'wpadminbar') !== false || stripos($content, 'admin-bar')) {
+            return $content;
+        }
+
+        if (preg_match('/<<input[^>]*name=["\']_wpnonce["\'][^>]*>/i', $content)) {
+            return $content;
+        }
+
+        $cache_file = $this->get_cache_file();
+        $meta_file = $this->get_cache_meta();
+        $lock_file = $this->get_lock_file();
+
+        $lock = @fopen($lock_file, 'c');
+        if (false === $lock) {
+            $this->send_cache_headers(time(), false);
+            return $content;
+        }
+
+        if (!flock($lock, LOCK_EX | LOCK_NB)) {
+            fclose($lock);
+            $this->send_cache_headers(time(), false);
+            return $content;
+        }
+
+        $meta = [
+            'time' => time(),
+            'uri'  => $_SERVER['REQUEST_URI'] ?? '/',
+            'hash' => hash('sha256', $content),
+            'size' => strlen($content),
+        ];
+
+        $meta_temp = $meta_file . '.tmp';
+        if (false === @file_put_contents($meta_temp, json_encode($meta), LOCK_EX)) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+            @unlink($meta_temp);
+            $this->send_cache_headers(time(), false);
+            return $content;
+        }
+        rename($meta_temp, $meta_file);
+
+        $cache_temp = $cache_file . '.tmp';
+        if (false === @file_put_contents($cache_temp, $content, LOCK_EX)) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+            @unlink($cache_temp);
+            $this->send_cache_headers(time(), false);
+            return $content;
+        }
+        rename($cache_temp, $cache_file);
+
+        if ($this->has_object_cache()) {
+            wp_cache_set($this->get_cache_key(), [
+                'content' => $content,
+                'time'    => $meta['time'],
+            ], self::CACHE_GROUP, $this->ttl);
+        }
+
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        @unlink($lock_file);
+
+        $this->send_cache_headers($meta['time'], false);
+        return $content;
+    }
+
+    private function send_cache_headers(int $cache_time, bool $is_hit): void {
+        if (headers_sent()) {
+            return;
+        }
+
+        if ($is_hit) {
+            header(self::HEADER_HIT . ': HIT');
+            header('Age: ' . (time() - $cache_time));
+        } else {
+            header(self::HEADER_HIT . ': MISS');
+        }
+
+        if ($this->skip) {
+            header(self::HEADER_HIT . ': BYPASS');
+            header('Cache-Control: no-cache, must-revalidate, max-age=0');
+            return;
+        }
+
+        $max_age = max(0, $this->ttl - (time() - $cache_time));
+        header('Cache-Control: public, max-age=' . $max_age);
+        header('Expires: ' . gmdate('D, d M Y H:i:s T', time() + $max_age));
+    }
+
+    private function send_bypass_header(): void {
+        if (!headers_sent()) {
+            header(self::HEADER_HIT . ': BYPASS');
+        }
+    }
+
+    private function delete_cache_files(): void {
+        @unlink($this->get_cache_file());
+        @unlink($this->get_cache_meta());
+        @unlink($this->get_lock_file());
+
+        if ($this->has_object_cache()) {
+            wp_cache_delete($this->get_cache_key(), self::CACHE_GROUP);
+        }
+    }
+
+    public function clear_all_cache(): void {
+        if ($this->has_object_cache()) {
+            wp_cache_flush_group(self::CACHE_GROUP);
+        }
+
+        if (!is_dir($this->cache_dir)) {
+            return;
+        }
+
+        $iterator = new DirectoryIterator($this->cache_dir);
+        foreach ($iterator as $file) {
+            if ($file->isFile() && !$file->isDot()) {
+                $ext = $file->getExtension();
+                if (in_array($ext, ['html', 'json', 'lock', 'tmp'], true)) {
+                    @unlink($file->getPathname());
+                }
+            }
+        }
+    }
+
+    public function clear_url_cache(string $url): void {
+        $parsed = parse_url($url);
+        $path = $parsed['path'] ?? '/';
+        if (!empty($parsed['query'])) {
+            $path .= '?' . $parsed['query'];
+        }
+
+        $key = md5((is_ssl() ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? '') . $path);
+
+        $files = [
+            $this->cache_dir . $key . '.html',
+            $this->cache_dir . $key . '.json',
+            $this->cache_dir . $key . '.lock',
+        ];
+
+        foreach ($files as $file) {
+            @unlink($file);
+        }
+
+        if ($this->has_object_cache()) {
+            wp_cache_delete($key, self::CACHE_GROUP);
+        }
+    }
+
+    public function handle_post_save(int $post_id, WP_Post $post, bool $update): void {
+        if (wp_is_post_revision($post_id)) {
+            return;
+        }
+
+        $this->clear_url_cache(get_permalink($post_id));
+        $this->clear_url_cache(home_url('/'));
+
+        if ($post->post_type === 'post') {
+            $this->clear_url_cache(get_permalink(get_option('page_for_posts', 0)) ?: home_url('/'));
+        }
+
+        $taxonomies = get_object_taxonomies($post->post_type);
+        foreach ($taxonomies as $taxonomy) {
+            $terms = get_the_terms($post_id, $taxonomy);
+            if (!empty($terms) && !is_wp_error($terms)) {
+                foreach ($terms as $term) {
+                    $this->clear_url_cache(get_term_link($term));
+                }
+            }
+        }
+    }
+
+    public function handle_post_trash(int $post_id): void {
+        $this->clear_url_cache(get_permalink($post_id));
+        $this->clear_all_cache();
+    }
+
+    public function handle_blog_delete(int $blog_id): void {
+        $site_dir = WP_CONTENT_DIR . '/cache/serverfreak-cache/site-' . $blog_id . '/';
+        if (is_dir($site_dir)) {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($site_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::CHILD_FIRST
+            );
+            foreach ($iterator as $file) {
+                if ($file->isDir()) {
+                    @rmdir($file->getPathname());
+                } else {
+                    @unlink($file->getPathname());
+                }
+            }
+            @rmdir($site_dir);
+        }
+    }
+
+    public function register_cli_commands(): void {
+        if (!class_exists('WP_CLI')) {
+            return;
+        }
+
+        WP_CLI::add_command('serverfreak-cache', Serverfreak_Cache_CLI::class);
+    }
+
+    public function get_stats(): array {
+        $stats = [
+            'total_files'   => 0,
+            'total_size'    => 0,
+            'oldest_cache'  => null,
+            'newest_cache'  => null,
+            'cache_dir'     => $this->cache_dir,
+            'ttl'           => $this->ttl,
+            'object_cache'  => $this->has_object_cache(),
+            'dynamic_pages' => count($this->dynamic_page_ids),
+            'dynamic_patterns' => count($this->dynamic_patterns),
+        ];
+
+        if (!is_dir($this->cache_dir)) {
+            return $stats;
+        }
+
+        $iterator = new DirectoryIterator($this->cache_dir);
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'html') {
+                $stats['total_files']++;
+                $stats['total_size'] += $file->getSize();
+                $mtime = $file->getMTime();
+                
+                if (null === $stats['oldest_cache'] || $mtime < $stats['oldest_cache']) {
+                    $stats['oldest_cache'] = $mtime;
+                }
+                if (null === $stats['newest_cache'] || $mtime > $stats['newest_cache']) {
+                    $stats['newest_cache'] = $mtime;
+                }
+            }
+        }
+
+        return $stats;
+    }
+}
+
+/**
+ * WP-CLI Commands
+ */
+class Serverfreak_Cache_CLI {
+
+    public function clear($args, $assoc_args): void {
+        $engine = Serverfreak_Instant_Cache::instance();
+
+        if (!empty($assoc_args['url'])) {
+            $engine->clear_url_cache($assoc_args['url']);
+            WP_CLI::success('Cache cleared for: ' . $assoc_args['url']);
+        } else {
+            $engine->clear_all_cache();
+            WP_CLI::success('All cache cleared.');
+        }
+    }
+
+    public function stats(): void {
+        $engine = Serverfreak_Instant_Cache::instance();
+        $stats = $engine->get_stats();
+
+        WP_CLI::line('Cache Directory: ' . $stats['cache_dir']);
+        WP_CLI::line('Total Files: ' . number_format($stats['total_files']));
+        WP_CLI::line('Total Size: ' . size_format($stats['total_size']));
+        WP_CLI::line('TTL: ' . $stats['ttl'] . ' seconds');
+        WP_CLI::line('Object Cache: ' . ($stats['object_cache'] ? 'Yes' : 'No'));
+        WP_CLI::line('Dynamic Pages: ' . $stats['dynamic_pages']);
+        WP_CLI::line('Dynamic Patterns: ' . $stats['dynamic_patterns']);
+
+        if ($stats['oldest_cache']) {
+            WP_CLI::line('Oldest Cache: ' . human_time_diff($stats['oldest_cache'], time()) . ' ago');
+        }
+        if ($stats['newest_cache']) {
+            WP_CLI::line('Newest Cache: ' . human_time_diff($stats['newest_cache'], time()) . ' ago');
+        }
+    }
+
+    public function test($args): void {
+        $url = $args[0];
+        $response = wp_remote_get($url, [
+            'headers' => ['Accept' => 'text/html'],
+            'timeout' => 30,
+        ]);
+
+        if (is_wp_error($response)) {
+            WP_CLI::error($response->get_error_message());
+        }
+
+        $headers = wp_remote_retrieve_headers($response);
+        $status = wp_remote_retrieve_response_code($response);
+
+        WP_CLI::line('Status: ' . $status);
+        WP_CLI::line('X-Cache-Status: ' . ($headers['x-cache-status'] ?? 'Not set'));
+        WP_CLI::line('Content-Type: ' . ($headers['content-type'] ?? 'Not set'));
+    }
+}
+
+// Initialize
+Serverfreak_Instant_Cache::instance();
