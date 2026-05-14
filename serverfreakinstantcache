@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Serverfreak Instant Cache
  * Description: Production-grade full-page cache. WooCommerce + CartFlows + multisite aware. Zero config.
- * Version: 2.0.4
+ * Version: 2.1.0
  * Author: Assistant
  * Network: true
  */
@@ -25,6 +25,8 @@ final class Serverfreak_Instant_Cache {
     private array $dynamic_patterns = [];
     private ?bool $has_object_cache = null;
     private bool $dynamic_pages_built = false;
+    private bool $is_cache_hit = false;
+    private int $cache_time = 0;
 
     private const CACHE_GROUP = 'serverfreak_cache';
     private const HEADER_HIT = 'X-Cache-Status';
@@ -45,12 +47,8 @@ final class Serverfreak_Instant_Cache {
 
     private function __clone() {}
 
-    /**
-     * Lazy object cache check — handles null return from wp_using_ext_object_cache()
-     */
     private function has_object_cache(): bool {
         if (null === $this->has_object_cache) {
-            // wp_using_ext_object_cache() can return null before object cache is loaded
             $status = wp_using_ext_object_cache();
             $this->has_object_cache = ($status === true);
         }
@@ -458,6 +456,36 @@ final class Serverfreak_Instant_Cache {
         return $this->cache_dir . $this->get_cache_key() . '.lock';
     }
 
+    /**
+     * Generate cache footer HTML comment
+     */
+    private function get_cache_footer(int $cache_time, bool $is_hit): string {
+        if (!apply_filters('serverfreak_cache_show_footer', true)) {
+            return '';
+        }
+
+        $age = human_time_diff($cache_time, time());
+        $ttl_remaining = human_time_diff(time(), $cache_time + $this->ttl);
+        $mode = $is_hit ? 'HIT' : 'MISS';
+        $storage = $this->has_object_cache() ? 'Object+Filesystem' : 'Filesystem';
+
+        return sprintf(
+            "\n<!--\n"
+            . "  ╔══════════════════════════════════════╗\n"
+            . "  ║  Serverfreak Instant Cache           ║\n"
+            . "  ║  Status: %-27s ║\n"
+            . "  ║  Cached: %-27s ║\n"
+            . "  ║  Expires in: %-23s ║\n"
+            . "  ║  Storage: %-28s ║\n"
+            . "  ╚══════════════════════════════════════╝\n"
+            . "-->\n",
+            $mode,
+            $age . ' ago',
+            $ttl_remaining,
+            $storage
+        );
+    }
+
     public function try_serve_cache(): void {
         if ($this->skip) {
             return;
@@ -469,8 +497,11 @@ final class Serverfreak_Instant_Cache {
         if ($this->has_object_cache()) {
             $cached = wp_cache_get($this->get_cache_key(), self::CACHE_GROUP);
             if (is_array($cached) && !empty($cached['content']) && (time() - $cached['time']) < $this->ttl) {
+                $this->cache_time = $cached['time'];
+                $this->is_cache_hit = true;
                 $this->send_cache_headers($cached['time'], true);
                 echo $cached['content'];
+                echo $this->get_cache_footer($cached['time'], true);
                 exit;
             }
         }
@@ -514,6 +545,8 @@ final class Serverfreak_Instant_Cache {
             }
         }
 
+        $this->cache_time = $meta['time'];
+        $this->is_cache_hit = true;
         $this->send_cache_headers($meta['time'], true);
 
         if ($this->has_object_cache()) {
@@ -524,6 +557,7 @@ final class Serverfreak_Instant_Cache {
         }
 
         echo $content;
+        echo $this->get_cache_footer($meta['time'], true);
         exit;
     }
 
@@ -575,17 +609,18 @@ final class Serverfreak_Instant_Cache {
         $lock = @fopen($lock_file, 'c');
         if (false === $lock) {
             $this->send_cache_headers(time(), false);
-            return $content;
+            return $content . $this->get_cache_footer(time(), false);
         }
 
         if (!flock($lock, LOCK_EX | LOCK_NB)) {
             fclose($lock);
             $this->send_cache_headers(time(), false);
-            return $content;
+            return $content . $this->get_cache_footer(time(), false);
         }
 
+        $cache_time = time();
         $meta = [
-            'time' => time(),
+            'time' => $cache_time,
             'uri'  => $_SERVER['REQUEST_URI'] ?? '/',
             'hash' => hash('sha256', $content),
             'size' => strlen($content),
@@ -597,24 +632,27 @@ final class Serverfreak_Instant_Cache {
             fclose($lock);
             @unlink($meta_temp);
             $this->send_cache_headers(time(), false);
-            return $content;
+            return $content . $this->get_cache_footer($cache_time, false);
         }
         rename($meta_temp, $meta_file);
 
+        // Store content with footer for cache file
+        $content_with_footer = $content . $this->get_cache_footer($cache_time, false);
+
         $cache_temp = $cache_file . '.tmp';
-        if (false === @file_put_contents($cache_temp, $content, LOCK_EX)) {
+        if (false === @file_put_contents($cache_temp, $content_with_footer, LOCK_EX)) {
             flock($lock, LOCK_UN);
             fclose($lock);
             @unlink($cache_temp);
             $this->send_cache_headers(time(), false);
-            return $content;
+            return $content . $this->get_cache_footer($cache_time, false);
         }
         rename($cache_temp, $cache_file);
 
         if ($this->has_object_cache()) {
             wp_cache_set($this->get_cache_key(), [
                 'content' => $content,
-                'time'    => $meta['time'],
+                'time'    => $cache_time,
             ], self::CACHE_GROUP, $this->ttl);
         }
 
@@ -622,8 +660,8 @@ final class Serverfreak_Instant_Cache {
         fclose($lock);
         @unlink($lock_file);
 
-        $this->send_cache_headers($meta['time'], false);
-        return $content;
+        $this->send_cache_headers($cache_time, false);
+        return $content . $this->get_cache_footer($cache_time, false);
     }
 
     private function send_cache_headers(int $cache_time, bool $is_hit): void {
