@@ -1,0 +1,83 @@
+#!/bin/bash
+
+set -euo pipefail
+
+CONF_FILE="/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+BACKUP_FILE="${CONF_FILE}.$(date +%Y%m%d-%H%M%S).bak"
+
+# Ensure file exists
+touch "$CONF_FILE"
+
+# Verification checks
+echo "Checking for existing 8G Firewall rules..."
+
+if grep -Fq "# 8G FIREWALL v1.5 20250927" "$CONF_FILE"; then
+    echo "ERROR: 8G Firewall header already exists in $CONF_FILE"
+    exit 1
+fi
+
+if grep -Fq "RewriteCond %{QUERY_STRING}" "$CONF_FILE"; then
+    echo "ERROR: Existing RewriteCond QUERY_STRING rules detected."
+    exit 1
+fi
+
+if grep -Fq "RewriteCond %{REQUEST_URI}" "$CONF_FILE"; then
+    echo "ERROR: Existing RewriteCond REQUEST_URI rules detected."
+    exit 1
+fi
+
+if grep -Fq "RewriteCond %{HTTP_USER_AGENT}" "$CONF_FILE"; then
+    echo "ERROR: Existing RewriteCond HTTP_USER_AGENT rules detected."
+    exit 1
+fi
+
+if grep -Fq "RewriteEngine On" "$CONF_FILE"; then
+    echo "ERROR: RewriteEngine On already exists."
+    exit 1
+fi
+
+echo "No existing matching rules found."
+echo "Creating backup: $BACKUP_FILE"
+
+cp -a "$CONF_FILE" "$BACKUP_FILE"
+
+echo "Appending 8G Firewall rules..."
+
+cat <<'EOF' >> "$CONF_FILE"
+
+# 8G FIREWALL v1.5 20250927
+# https://perishablepress.com/8g-firewall/
+
+# Addon available: Block AI Bots
+# https://perishablepress.com/ultimate-ai-block-list/
+
+# 8G:[CORE]
+#ServerSignature Off
+#Options -Indexes
+RewriteEngine On
+#RewriteBase /
+
+<IfModule mod_rewrite.c>
+
+# PASTE YOUR FULL 8G RULES HERE
+
+</IfModule>
+
+EOF
+
+echo "Running Apache config test..."
+
+if apachectl configtest; then
+    echo "Apache configuration test PASSED."
+else
+    echo "Apache configuration test FAILED."
+    echo "Restoring backup..."
+
+    cp -a "$BACKUP_FILE" "$CONF_FILE"
+
+    exit 1
+fi
+
+echo "Done."
+echo "8G Firewall rules added successfully."
+echo "Backup saved at: $BACKUP_FILE"
