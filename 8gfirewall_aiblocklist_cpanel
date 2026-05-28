@@ -278,6 +278,12 @@ else
     exit 1
 fi
 
+echo "Rebuilding Apache configuration..."
+/scripts/rebuildhttpdconf
+
+echo "Restarting Apache..."
+/scripts/restartsrv_httpd
+
 echo "Done."
 echo "8G Firewall rules added successfully."
 echo "Backup saved at: $BACKUP_FILE"
