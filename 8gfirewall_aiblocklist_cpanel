@@ -261,6 +261,9 @@ RewriteEngine On
 	RewriteCond %{HTTP_USER_AGENT} (Zhuque\ AI|Zimm) [NC]
 
 	RewriteRule (.*) - [F,L]
+
+	RewriteRule ^/(xmlrpc|wp-trackback)\.php - [F,L,NC]
+
 </IfModule>
 
 EOF
