@@ -150,16 +150,12 @@ cat <<'EOF' > "$FW_FILE"
 # PART B: Global Access Control
 # --------------------------------------------
 
-<RequireAll>
  Require all granted
  Require not env block_8g
-</RequireAll>
 
-<Limit GET POST PUT DELETE PATCH OPTIONS>
  Order allow,deny
  Allow from all
  Deny from env=block_8g
-</Limit>
 
 # --------------------------------------------
 # PART C: Original 8G mod_rewrite Rules
