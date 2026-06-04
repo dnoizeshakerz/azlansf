@@ -150,7 +150,7 @@ cat <<'EOF' > "$FW_FILE"
 # PART B: Global Access Control
 # --------------------------------------------
 
-<<Location />
+<Location />
     <RequireAll>
         Require all granted
         Require not env block_8g
