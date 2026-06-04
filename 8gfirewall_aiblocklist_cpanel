@@ -156,7 +156,6 @@ cat <<'EOF' > "$FW_FILE"
         Require not env block_8g
     </RequireAll>
 </Location>
-
 # --------------------------------------------
 # PART C: Original 8G mod_rewrite Rules
 # RewriteOptions InheritDown = Apache 2.4.8+ applies to all vhosts
