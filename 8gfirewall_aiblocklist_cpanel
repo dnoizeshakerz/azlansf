@@ -155,7 +155,7 @@ cat <<'EOF' > "$FW_FILE"
         Require all granted
         Require not env block_8g
     </RequireAll>
-</<Location>
+<Location>
 
 # --------------------------------------------
 # PART C: Original 8G mod_rewrite Rules
