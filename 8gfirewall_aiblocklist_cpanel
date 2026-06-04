@@ -150,12 +150,16 @@ cat <<'EOF' > "$FW_FILE"
 # PART B: Global Access Control
 # --------------------------------------------
 
-<Location />
-    <RequireAll>
-        Require all granted
-        Require not env block_8g
-    </RequireAll>
-</Location>
+<RequireAll>
+ Require all granted
+ Require not env block_8g
+</RequireAll>
+
+<Limit GET POST PUT DELETE PATCH OPTIONS>
+ Order allow,deny
+ Allow from all
+ Deny from env=block_8g
+</Limit>
 
 # --------------------------------------------
 # PART C: Original 8G mod_rewrite Rules
@@ -180,7 +184,7 @@ RewriteCond %{QUERY_STRING} (/|%2f)(:|%3a)(/|%2f) [NC,OR]
 RewriteCond %{QUERY_STRING} (etc/(hosts|motd|shadow)) [NC,OR]
 RewriteCond %{QUERY_STRING} (order(\\s|%20)by(\\s|%20)1--) [NC,OR]
 RewriteCond %{QUERY_STRING} (/|%2f)(\*|%2a)(\*|%2a)(/|%2f) [NC,OR]
-RewriteCond %{QUERY_STRING} (\`||<|<|>|\^|\||\\|0x00|%00|%0d%0a) [NC,OR]
+RewriteCond %{QUERY_STRING} (\`|\\|<|>|\\^|\\|\\\\|0x00|%00|%0d%0a) [NC,OR]
 RewriteCond %{QUERY_STRING} (f?ckfinder|f?ckeditor|fullclick) [NC,OR]
 RewriteCond %{QUERY_STRING} ((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
 RewriteCond %{QUERY_STRING} (localhost|127(\.|%2e)0(\.|%2e)0(\.|%2e)1) [NC,OR]
@@ -193,15 +197,17 @@ RewriteCond %{QUERY_STRING} (\+|%2b|%20)(d|%64|%44)(e|%65|%45)(l|%6c|%4c)(e|%65|
 RewriteCond %{QUERY_STRING} (\+|%2b|%20)(i|%69|%49)(n|%6e|%4e)(s|%73|%53)(e|%65|%45)(r|%72|%52)(t|%74|%54)(\+|%2b|%20) [NC,OR]
 RewriteCond %{QUERY_STRING} (\+|%2b|%20)(s|%73|%53)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(c|%63|%43)(t|%74|%54)(\+|%2b|%20) [NC,OR]
 RewriteCond %{QUERY_STRING} (\+|%2b|%20)(u|%75|%55)(p|%70|%50)(d|%64|%44)(a|%61|%41)(t|%74|%54)(e|%65|%45)(\+|%2b|%20) [NC,OR]
-RewriteCond %{QUERY_STRING} (\\x00|(\"|%22|\'|%27)?0(\"|%22|\'|%27)?(=|%3d)(\"|%22|\'|%27)?0|cast(\(|%28)0x|or%201(=|%3d)1) [NC,OR]
-RewriteCond %{QUERY_STRING} (g|%67|%47)(l|%6c|%4c)(o|%6f|%4f)(b|%62|%42)(a|%61|%41)(l|%6c|%4c)(s|%73|%53)(=|\[|%\[0-9A-Z]{0,2}) [NC,OR]
-RewriteCond %{QUERY_STRING} (_|%5f)(r|%72|%52)(e|%65|%45)(q|%71|%51)(u|%75|%55)(e|%65|%45)(s|%73|%53)(t|%74|%54)(=|\[|%\[0-9A-Z]{2,}) [NC,OR]
+RewriteCond %{QUERY_STRING} (\\x00|("|%22|'|%27)?0("|%22|'|%27)?(=|%3d)("|%22|'|%27)?0|cast(\(|%28)0x|or%201(=|%3d)1) [NC,OR]
+RewriteCond %{QUERY_STRING} (g|%67|%47)(l|%6c|%4c)(o|%6f|%4f)(b|%62|%42)(a|%61|%41)(l|%6c|%4c)(s|%73|%53)(=|\[|%
+[0-9A-Z]{0,2}) [NC,OR]
+RewriteCond %{QUERY_STRING} (_|%5f)(r|%72|%52)(e|%65|%45)(q|%71|%51)(u|%75|%55)(e|%65|%45)(s|%73|%53)(t|%74|%54)(=|\[|%
+[0-9A-Z]{2,}) [NC,OR]
 RewriteCond %{QUERY_STRING} (j|%6a|%4a)(a|%61|%41)(v|%76|%56)(a|%61|%31)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(:|%3a)(.*)(;|%3b|\)|%29) [NC,OR]
 RewriteCond %{QUERY_STRING} (b|%62|%42)(a|%61|%41)(s|%73|%53)(e|%65|%45)(6|%36)(4|%34)(_|%5f)(e|%65|%45|d|%64|%44)(e|%65|%45|n|%6e|%4e)(c|%63|%43)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
 RewriteCond %{QUERY_STRING} (@copy|\$_(files|get|post)|allow_url_(fopen|include)|auto_prepend_file|blexbot|browsersploit|call_user_func_array|(php|web)shell|curl(_exec|test)|disable_functions?|document_root) [NC,OR]
 RewriteCond %{QUERY_STRING} (elastix|encodeuricom|exploit|fclose|fgets|file_put_contents|fputs|fsbuff|fsockopen|gethostbyname|grablogin|hmei7|hubs_post-cta|input_file|invokefunction|(\b)load_file|open_basedir|outfile|p3dlite) [NC,OR]
 RewriteCond %{QUERY_STRING} (pass(=|%3d)shell|passthru|phpinfo|phpshells|popen|proc_open|quickbrute|remoteview|root_path|safe_mode|shell_exec|site((.){0,2})copier|sp_executesql|sux0r|trojan|udtudt|user_func_array|wget|wp_insert_user|xertive) [NC,OR]
-RewriteCond %{QUERY_STRING} (;||<|<|>|\'|\"|\)|%0a|%0d|%22|%27|%3c|%3e|%00)(.*)(/\*|alter|base64|benchmark|cast|concat|convert|create|encode|declare|delay|delete|drop|hex|insert|load|md5|null|replace|request|script|select|set|sleep|truncate|unhex|update) [NC,OR]
+RewriteCond %{QUERY_STRING} (;||<|>|'|"|\)|%0a|%0d|%22|%27|%3c|%3e|%00)(.*)(/\*|alter|base64|benchmark|cast|concat|convert|create|encode|declare|delay|delete|drop|hex|insert|load|md5|null|replace|request|script|select|set|sleep|truncate|unhex|update) [NC,OR]
 RewriteCond %{QUERY_STRING} ((\+|%2b)(concat|delete|get|select|union)(\+|%2b)) [NC,OR]
 RewriteCond %{QUERY_STRING} (union)(.*)(select)(.*)(\(|%28) [NC,OR]
 RewriteCond %{QUERY_STRING} (concat|eval)(.*)(\(|%28) [NC]
@@ -212,19 +218,19 @@ RewriteRule .* - [F]
 
 RewriteCond %{REQUEST_URI} (,,,) [NC,OR]
 RewriteCond %{REQUEST_URI} (-------) [NC,OR]
-RewriteCond %{REQUEST_URI} (\^|\`||<|<|>|\\|\|) [NC,OR]
+RewriteCond %{REQUEST_URI} (\^|\`||<|>|\\|\|) [NC,OR]
 RewriteCond %{REQUEST_URI} ([a-z0-9]{2000,}) [NC,OR]
 RewriteCond %{REQUEST_URI} (=?\(\'|%27)/?)(\.) [NC,OR]
-RewriteCond %{REQUEST_URI} (/)(\*|\"|\'|\.|,|&|&?)/?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(\*|"|'|\.|,|&|&?)/?$ [NC,OR]
 RewriteCond %{REQUEST_URI} (\.)(php)(\()?([0-9]+)(\))?(/)?$ [NC,OR]
 RewriteCond %{REQUEST_URI} /((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
 RewriteCond %{REQUEST_URI} (\.(s?ftp-?)config|(s?ftp-?)config\.) [NC,OR]
 RewriteCond %{REQUEST_URI} (/)(f?ckfinder|fck/|fckeditor|fullclick) [NC,OR]
 RewriteCond %{REQUEST_URI} (/)(force-)?download|framework/main(\.php) [NC,OR]
-RewriteCond %{REQUEST_URI} (\{0\}|\"?0\"?=\"?0|(/\(|\.{3}|\+{4}|\\\") [NC,OR]
+RewriteCond %{REQUEST_URI} (\{0\}|"?0"?="?0|(/\(|\.{3}|\+{4}|\\") [NC,OR]
 RewriteCond %{REQUEST_URI} (/)(vbull(etin)?|boards|vbforum|vbweb|webvb)(/)? [NC,OR]
 RewriteCond %{REQUEST_URI} (\.|20)(get|the)(_)(permalink|posts_page_url)(\() [NC,OR]
-RewriteCond %{REQUEST_URI} (///|\?\?|/&&|/\*(.*)\*/|/:/|\\|0x00|%00|%0d%0a) [NC,OR]
+RewriteCond %{REQUEST_URI} (///|\?\?|/&&|/\*(.*)\*/|/:/|\\\\|0x00|%00|%0d%0a) [NC,OR]
 RewriteCond %{REQUEST_URI} (/)(cgi_?)?alfa(_?cgiapi|_?data|_?v[0-9]+)?(\.php) [NC,OR]
 RewriteCond %{REQUEST_URI} (thumbs?(_editor|open)?|tim(thumbs?)?)((\.|%2e)php) [NC,OR]
 RewriteCond %{REQUEST_URI} (/)(boot)?_?admin(er|istrator|s)(_events)?(\.php) [NC,OR]
@@ -274,7 +280,7 @@ RewriteRule .* - [F]
 # 8G:[USER AGENT]
 
 RewriteCond %{HTTP_USER_AGENT} ([a-z0-9]{2000,}) [NC,OR]
-RewriteCond %{HTTP_USER_AGENT} (<%0a|%0d|%27|%3c|%3e|%00|0x00|\\x22|\\") [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (<%0a|%0d|%27|%3c|%3e|%00|0x00|\\x22|\") [NC,OR]
 RewriteCond %{HTTP_USER_AGENT} (ahrefs|archiver|curl|libwww-perl|pycurl|scan) [NC,OR]
 RewriteCond %{HTTP_USER_AGENT} (oppo\sa33|(c99|php|web)shell|site((.){0,2})copier) [NC,OR]
 RewriteCond %{HTTP_USER_AGENT} (base64_decode|bin/bash|disconnect|eval|unserializ) [NC,OR]
@@ -307,7 +313,7 @@ RewriteRule .* - [F]
 
 # 8G:[HTTP COOKIE]
 
-RewriteCond %{HTTP_COOKIE} (||<|<|>|\'|%0A|%0D|%27|%00) [NC]
+RewriteCond %{HTTP_COOKIE} (||<|>|'|%0A|%0D|%27|%00) [NC]
 
 RewriteRule .* - [F]
 
@@ -351,7 +357,7 @@ echo "[*] Ensuring include directive is present in ${PRE_VH_GLOBAL}..."
 if ! grep -Fxq "$INCLUDE_LINE" "$PRE_VH_GLOBAL"; then
     # Remove any commented or malformed versions first
     sed -i '/^[#[:space:]]*Include.*8gfirewall.conf/d' "$PRE_VH_GLOBAL"
-    
+
     # Prepend the include line (so it loads before virtual hosts)
     {
         echo ""
