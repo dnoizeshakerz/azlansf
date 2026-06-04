@@ -150,12 +150,12 @@ cat <<'EOF' > "$FW_FILE"
 # PART B: Global Access Control
 # --------------------------------------------
 
-<Location />
+<<Location />
     <RequireAll>
         Require all granted
         Require not env block_8g
     </RequireAll>
-<Location>
+</Location>
 
 # --------------------------------------------
 # PART C: Original 8G mod_rewrite Rules
