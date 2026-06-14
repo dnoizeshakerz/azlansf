@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Ensure the script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this script as root."
+  exit 1
+fi
+
+echo "========================================================================"
+# 1. STOP AND REMOVE ANUBIS DOCKER CONTAINERS
+# ========================================================================
+echo "Step 1: Stopping and removing Anubis WAF container..."
+if [ -d "/opt/anubis-waf/" ]; then
+    cd /opt/anubis-waf/
+    # Stop containers and remove associated anonymous volumes
+    docker compose down --volumes --remove-orphans 2>/dev/null || true
+    cd ~
+    rm -rf /opt/anubis-waf/
+    echo "-> Anubis directory and containers removed successfully."
+else
+    echo "-> Anubis directory (/opt/anubis-waf/) not found. Skipping."
+fi
+
+
+echo "========================================================================"
+# 2. REVERT APACHE PRE_VIRTUALHOST CONFIGURATION
+# ========================================================================
+echo "Step 2: Removing HTTPS environment variable from Apache..."
+APACHE_CONF="/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+
+if [ -f "$APACHE_CONF" ]; then
+    # Safely remove only the specific line added during setup
+    sed -i "/SetEnvIf X-Forwarded-Proto \"https\" HTTPS=on/d" "$APACHE_CONF"
+    echo "-> Successfully removed configuration from $APACHE_CONF."
+else
+    echo "-> $APACHE_CONF does not exist. Skipping."
+fi
+
+
+echo "========================================================================"
+# 3. RESTORE DEFAULT NGINX CPANEL PROXY DATA
+# ========================================================================
+echo "Step 3: Restoring default cPanel Nginx proxy configuration..."
+NGINX_CONF="/etc/nginx/conf.d/includes-optional/cpanel-proxy.conf"
+
+mkdir -p "$(dirname "$NGINX_CONF")"
+
+# Using single-quoted 'EOF' to prevent Bash from interpreting Nginx variables (like $host)
+cat << 'EOF' > "$NGINX_CONF"
+proxy_hide_header Upgrade; # needed to avoid h2 problem, will just fallback to `proxy_http_version`
+
+# Explicitly set HTTP/1.0 for backend proxy connections to avoid 421 Misdirected
+# Request errors from Apache v2.4.64+ mod_ssl strict SNI checking (EA4-55/EA4-56).
+# HTTP/1.0 forces Connection: close, triggering a fresh TLS handshake per request
+# with matching SNI and Host header.
+# NOTE: nginx 1.29.7+ defaults to HTTP/1.1 (EA4-257) - do NOT rely on the default.
+# For WebSocket support, users can override per-location in custom configs.
+# See also: docs/Apache-2.4.64-421.md
+proxy_http_version 1.0;
+
+# Headers
+proxy_set_header Accept-Encoding "";  # Optimize encoding
+proxy_set_header Connection "";  # Enable keepalives
+proxy_set_header Host $host;
+proxy_set_header Proxy "";
+proxy_set_header Referer $http_referer;
+
+set $forwarded_host $host;
+if ($CPANEL_SERVICE_SUBDOMAIN) {
+    set $forwarded_host "";
+}
+
+# X headers
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Host $forwarded_host;
+proxy_set_header X-Forwarded-Port $server_port;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Server $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+proxy_set_header CF-Visitor $http_cf_visitor;
+
+# non-headers
+proxy_connect_timeout 300s;
+proxy_read_timeout 300s;
+proxy_send_timeout 300s;
+proxy_buffers 256 16k;
+proxy_buffer_size 128k;
+proxy_busy_buffers_size 256k;
+proxy_temp_file_write_size 256k;
+set $CACHE_KEY_PREFIX "";
+include conf.d/includes-optional/set-CACHE_KEY_PREFIX.conf;
+proxy_cache_key "$CACHE_KEY_PREFIX$scheme://$host$request_uri";
+proxy_ssl_server_name on;
+proxy_ssl_name $host;
+
+# Because we are proxying to multiple virtual hosts on the same IP (SNI-based routing):
+#    We disable session reuse to avoid collisions (421)
+proxy_ssl_session_reuse off;
+
+# Vendor specific headers
+include conf.d/includes-optional/cpanel-proxy-vendors/*.conf;
+
+# cPanel specific headers
+include conf.d/includes-optional/cpanel-proxy-xt.conf;
+EOF
+echo "-> Proxy configuration written to $NGINX_CONF."
+echo "========================================================================"
+# 6. BUILD, REBUILD AND DEPLOY ARCHITECTURE
+# ========================================================================
+echo "Final Step: Rebuilding web configurations and starting containers..."
+/scripts/rebuildhttpdconf
+/scripts/ea-nginx config --all
+/scripts/restartsrv_httpd
+echo "========================================================================"
+echo "ANUBIS WAF DEPLOYMENT SUCCESSFUL!"
+echo "========================================================================"
