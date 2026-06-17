@@ -1,0 +1,119 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root" 
+   exit 1
+fi
+
+echo "Starting BotStopper installation..."
+
+# 1. Create botstopper-upstream.conf
+cat << 'EOF' > /etc/nginx/conf.d/botstopper-upstream.conf
+upstream botstopper {
+    hash $remote_addr consistent;
+    server 103.27.72.252:8923 max_fails=2 fail_timeout=5s;
+    server 185.93.166.3:8923  max_fails=2 fail_timeout=5s;
+    keepalive 32;
+}
+ 
+# Bypass BotStopper on cPanel service subdomains
+map $host $botstopper_bypass {
+    default 0;
+    "~*^(?:cpanel|whm|webmail|webdisk|cpcalendars|cpcontacts|autodiscover|autoconfig)\." 1;
+}
+EOF
+echo "✅ Created /etc/nginx/conf.d/botstopper-upstream.conf"
+
+# 2. Ensure server-includes directory exists and create botstopper.conf
+mkdir -p /etc/nginx/conf.d/server-includes
+cat << 'EOF' > /etc/nginx/conf.d/server-includes/botstopper.conf
+location ^~ /.within.website/ {
+    auth_request off;
+    proxy_pass http://botstopper;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+ 
+location ^~ /.well-known/acme-challenge/ {
+    auth_request off;
+    include conf.d/includes-optional/cpanel-proxy.conf;
+}
+location ^~ /.well-known/pki-validation/ {
+    auth_request off;
+    include conf.d/includes-optional/cpanel-proxy.conf;
+}
+ 
+location = /.botstopper-check {
+    internal;
+    auth_request off;
+    if ($botstopper_bypass) { return 200; }
+    proxy_pass http://botstopper/.within.website/x/cmd/anubis/api/check;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Uri $request_uri;
+}
+ 
+location @redirectToBotStopper {
+    auth_request off;
+    return 307 https://$host/.within.website/?redir=https://$host$request_uri;
+}
+ 
+location @botstopper_failopen {
+    auth_request off;
+    include conf.d/includes-optional/cpanel-proxy.conf;
+}
+ 
+auth_request /.botstopper-check;
+error_page 401 = @redirectToBotStopper;
+error_page 500 502 504 = @botstopper_failopen;
+EOF
+echo "✅ Created /etc/nginx/conf.d/server-includes/botstopper.conf"
+
+# 3. Open TCP_OUT port 8923 in CSF
+if [ -f /etc/csf/csf.conf ]; then
+    echo "⚙️ Configuring CSF to open TCP_OUT port 8923..."
+    # Check if 8923 is already present in TCP_OUT
+    if ! grep -qE '^TCP_OUT =.*(^|,)8923(,|$)' /etc/csf/csf.conf; then
+        sed -i 's/^TCP_OUT = "\(.*\)"/TCP_OUT = "\1,8923"/' /etc/csf/csf.conf
+        csf -ra > /dev/null 2>&1
+        echo "✅ CSF configured and restarted."
+    else
+        echo "✅ Port 8923 is already open in CSF."
+    fi
+else
+    echo "⚠️ CSF configuration not found. Please ensure port 8923 is open manually."
+fi
+
+# 4. Test and reload Nginx
+echo "⚙️ Testing Nginx configuration..."
+if nginx -t; then
+    echo "⚙️ Reloading Nginx..."
+    systemctl reload nginx
+    echo "🎉 BotStopper installation successful!"
+else
+    echo "❌ Nginx test failed. Please check the syntax errors. Reload aborted."
+    exit 1
+fi
+
+# 5. Run connection tests
+echo "----------------------------------------"
+echo "Running connectivity tests..."
+for ip in 103.27.72.252 185.93.166.3; do
+  echo -n "$ip: "
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 \
+    -H 'X-Real-IP: 203.0.113.10' -H 'X-Forwarded-Proto: https' \
+    -A 'Mozilla/5.0 Chrome/130.0' \
+    http://$ip:8923/.within.website/x/cmd/anubis/api/check
+done
+echo "ℹ️  (Note: Both must return '401'. If it times out or returns '000', CSF TCP_OUT was not opened properly.)"
+echo "----------------------------------------"
