@@ -1,640 +1,1041 @@
-
-# Build the CORRECTED Apache script
-# Key fixes needed:
-# 1. Use single-quoted heredoc 'EOF' to prevent ALL bash variable expansion
-# 2. Proper escaping of $ in patterns
-# 3. Fix sed command for inserting Include
-# 4. Better Apache path detection
-# 5. Handle the case where httpd.conf doesn't have VirtualHost lines
-
-apache_script = r'''#!/bin/bash
+#!/bin/bash
 #===============================================================================
-# 8G FIREWALL v1.5 - Global Deployment Script for DirectAdmin + Apache
-# Date: 2026-06-02
-# Description: Installs 8G Firewall rules globally for all Apache virtual hosts
+# 8G FIREWALL v1.5 - Unified Deployment Script
+# Supports:
+#   - DirectAdmin + Apache
+#   - DirectAdmin + OpenLiteSpeed
+#   - cPanel + Apache
+#   - cPanel + ea-nginx
+#   - cPanel + LiteSpeed
 #===============================================================================
 
-set -e
+set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Configuration paths
-APACHE_CONF=""
-APACHE_CONF_DIR=""
-APACHE_CONF_D=""
-CUSTOM_CONF=""
 BACKUP_DIR="/root/8g-firewall-backups"
-APACHE_BIN=""
+MARKER_START="# === 8G FIREWALL START ==="
+MARKER_END="# === 8G FIREWALL END ==="
 
 #===============================================================================
-# Functions
+# UTILITIES
 #===============================================================================
 
 check_root() {
-    if [ "$(id -u)" != "0" ]; then
+    if [[ "$(id -u)" != "0" ]]; then
         echo -e "${RED}Error: This script must be run as root${NC}"
         exit 1
     fi
 }
 
-detect_apache() {
-    echo -e "${YELLOW}[INFO] Detecting Apache installation...${NC}"
-    
-    # DirectAdmin typically uses /usr/local/apache/
-    if [ -f /usr/local/apache/bin/httpd ]; then
-        APACHE_BIN="/usr/local/apache/bin/httpd"
-        APACHE_CONF="/usr/local/apache/conf/httpd.conf"
-        APACHE_CONF_DIR="/usr/local/apache/conf/extra"
-        APACHE_CONF_D="/usr/local/apache/conf/conf.d"
-        CUSTOM_CONF="/usr/local/apache/conf/extra/8g-firewall.conf"
-    elif [ -f /usr/local/apache2/bin/httpd ]; then
-        APACHE_BIN="/usr/local/apache2/bin/httpd"
-        APACHE_CONF="/usr/local/apache2/conf/httpd.conf"
-        APACHE_CONF_DIR="/usr/local/apache2/conf/extra"
-        APACHE_CONF_D="/usr/local/apache2/conf/conf.d"
-        CUSTOM_CONF="/usr/local/apache2/conf/extra/8g-firewall.conf"
-    elif [ -f /etc/httpd/bin/httpd ]; then
-        APACHE_BIN="/etc/httpd/bin/httpd"
-        APACHE_CONF="/etc/httpd/conf/httpd.conf"
-        APACHE_CONF_DIR="/etc/httpd/conf/extra"
-        APACHE_CONF_D="/etc/httpd/conf.d"
-        CUSTOM_CONF="/etc/httpd/conf/extra/8g-firewall.conf"
-    elif [ -f /usr/sbin/httpd ]; then
-        APACHE_BIN="/usr/sbin/httpd"
-        if [ -f /etc/httpd/conf/httpd.conf ]; then
-            APACHE_CONF="/etc/httpd/conf/httpd.conf"
-            APACHE_CONF_DIR="/etc/httpd/conf/extra"
-            APACHE_CONF_D="/etc/httpd/conf.d"
-            CUSTOM_CONF="/etc/httpd/conf/extra/8g-firewall.conf"
-        elif [ -f /etc/apache2/apache2.conf ]; then
-            APACHE_CONF="/etc/apache2/apache2.conf"
-            APACHE_CONF_DIR="/etc/apache2/conf-available"
-            APACHE_CONF_D="/etc/apache2/conf.d"
-            CUSTOM_CONF="/etc/apache2/conf-available/8g-firewall.conf"
-        fi
-    elif command -v httpd >/dev/null 2>&1; then
-        APACHE_BIN=$(command -v httpd)
-        # Try to find config
-        APACHE_CONF=$($APACHE_BIN -V 2>/dev/null | grep SERVER_CONFIG_FILE | awk -F'"' '{print $2}')
-        if [ -z "$APACHE_CONF" ] || [ ! -f "$APACHE_CONF" ]; then
-            APACHE_CONF="/etc/httpd/conf/httpd.conf"
-        fi
-        APACHE_CONF_DIR=$(dirname "$APACHE_CONF")/extra
-        APACHE_CONF_D=$(dirname "$APACHE_CONF")/conf.d
-        CUSTOM_CONF="$APACHE_CONF_DIR/8g-firewall.conf"
-    else
-        echo -e "${RED}Error: Apache (httpd) not found${NC}"
-        exit 1
-    fi
-    
-    if [ ! -f "$APACHE_CONF" ]; then
-        echo -e "${RED}Error: Apache config not found at $APACHE_CONF${NC}"
-        exit 1
-    fi
-    
-    APACHE_VERSION=$($APACHE_BIN -v 2>/dev/null | head -1 | grep -oE 'Apache/[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-    echo -e "${GREEN}[OK] Apache: $APACHE_VERSION${NC}"
-    echo -e "${GREEN}[OK] Binary: $APACHE_BIN${NC}"
-    echo -e "${GREEN}[OK] Config: $APACHE_CONF${NC}"
-    echo -e "${GREEN}[OK] Extra dir: $APACHE_CONF_DIR${NC}"
-}
-
-create_backup() {
-    echo -e "${YELLOW}[INFO] Creating backups...${NC}"
+backup_file() {
+    local src="$1"
+    local dst="$2"
     mkdir -p "$BACKUP_DIR"
-    
-    if [ -f "$APACHE_CONF" ]; then
-        cp "$APACHE_CONF" "$BACKUP_DIR/httpd.conf.backup.$(date +%Y%m%d_%H%M%S)"
+    if [[ -f "$src" ]]; then
+        cp -a "$src" "$dst"
+        echo -e "${GREEN}[OK] Backup: $dst${NC}"
     fi
-    
-    if [ -f "$CUSTOM_CONF" ]; then
-        cp "$CUSTOM_CONF" "$BACKUP_DIR/8g-firewall.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    fi
-    
-    echo -e "${GREEN}[OK] Backups saved to $BACKUP_DIR${NC}"
 }
 
-create_8g_config() {
-    echo -e "${YELLOW}[INFO] Creating 8G Firewall configuration...${NC}"
-    
-    mkdir -p "$APACHE_CONF_DIR"
-    
-    # Use single-quoted heredoc delimiter to prevent ANY variable expansion
-    cat > "$CUSTOM_CONF" << '8G_EOF'
 #===============================================================================
-# 8G FIREWALL v1.5 - Global Protection for Apache
-# Source: https://perishablepress.com/8g-firewall/
-# Applies to: All virtual hosts
+# DETECTION
 #===============================================================================
 
-# ============================================
-# 8G Firewall v1.5 - Unified Apache + LiteSpeed
-# ============================================
-# This file combines:
-#   1. Original mod_rewrite rules (Apache 2.4.8+ with InheritDown)
-#   2. SetEnvIfNoCase conversions (works globally on LiteSpeed & Apache)
-#   3. Global access control via <Location />
-#
-# PLACE IN: /etc/apache2/conf.d/includes/pre_virtualhost_global.conf
-# REBUILD:  /scripts/rebuildhttpdconf
-# RESTART:  service lsws restart   (LiteSpeed)
-#           service httpd restart  (Apache)
-#
-# HOW IT WORKS:
-# - Apache 2.4.8+: RewriteOptions InheritDown makes ALL original 8G
-#   rules apply to every VirtualHost. SetEnvIf adds extra protection.
-# - LiteSpeed: Server-level SetEnvIf + access control applies to all
-#   vhosts. The rewrite rules in this file act as fallback.
-# - Apache 2.2: SetEnvIf + <Location /> provides UA/Referer/Method
-#   blocking. Rewrite rules only apply to main server.
-# ============================================
+detect_panel() {
+    if [[ -d /usr/local/cpanel && -f /usr/local/cpanel/cpanel ]]; then
+        PANEL="cpanel"
+    elif [[ -d /usr/local/directadmin && -f /usr/local/directadmin/directadmin ]]; then
+        PANEL="directadmin"
+    else
+        echo -e "${RED}Error: No supported panel detected (cPanel or DirectAdmin)${NC}"
+        exit 1
+    fi
+    echo -e "${BLUE}[INFO] Panel: $PANEL${NC}"
+}
 
+detect_webserver() {
+    case "$PANEL" in
+        cpanel)
+            if [[ -d /etc/nginx && -f /etc/nginx/nginx.conf ]] && { rpm -q ea-nginx &>/dev/null || [[ -f /etc/nginx/nginx.conf ]]; }; then
+                # Distinguish nginx-only vs nginx+apache
+                if [[ ! -f /usr/sbin/httpd && ! -f /usr/local/apache/bin/httpd && ! -d /etc/apache2/conf.d ]]; then
+                    WEBSERVER="nginx"
+                elif [[ -f /usr/local/lsws/bin/lshttpd ]] || pgrep -x "litespeed" &>/dev/null; then
+                    WEBSERVER="litespeed"
+                else
+                    WEBSERVER="apache"
+                fi
+            elif [[ -f /usr/local/lsws/bin/lshttpd ]] || pgrep -x "litespeed" &>/dev/null; then
+                WEBSERVER="litespeed"
+            elif [[ -f /usr/sbin/httpd || -f /usr/local/apache/bin/httpd || -d /etc/apache2/conf.d ]]; then
+                WEBSERVER="apache"
+            else
+                echo -e "${RED}Error: Could not detect web server on cPanel${NC}"
+                exit 1
+            fi
+            ;;
+        directadmin)
+            local cb_options="/usr/local/directadmin/custombuild/options.conf"
+            if [[ -f "$cb_options" ]]; then
+                local ws
+                ws=$(grep "^webserver=" "$cb_options" 2>/dev/null | cut -d= -f2)
+                case "$ws" in
+                    openlitespeed) WEBSERVER="openlitespeed" ;;
+                    litespeed)     WEBSERVER="litespeed" ;;
+                    nginx)         WEBSERVER="nginx" ;;
+                    *)             WEBSERVER="apache" ;;
+                esac
+            else
+                if [[ -f /usr/local/lsws/bin/lshttpd ]]; then
+                    WEBSERVER="openlitespeed"
+                elif [[ -f /usr/local/apache/bin/httpd || -f /usr/sbin/httpd ]]; then
+                    WEBSERVER="apache"
+                else
+                    echo -e "${RED}Error: Could not detect web server on DirectAdmin${NC}"
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
+    echo -e "${BLUE}[INFO] Web server: $WEBSERVER${NC}"
+}
+
+#===============================================================================
+# RULE CONTENT
+#===============================================================================
+
+apache_setenvif() {
+    cat <<'APACHE_EOF'
 # --------------------------------------------
 # PART A: SetEnvIfNoCase Global Blocking
 # Works on BOTH Apache and LiteSpeed
 # --------------------------------------------
-<IfModule mod_setenvif.c>
 
-    # --- Request Method ---
-    SetEnvIfNoCase Request_Method "^(connect|debug|move|trace|track)$" block_8g
+ # --- Request Method ---
+ SetEnvIfNoCase Request_Method "^(connect|debug|move|trace|track)$" block_8g
 
-    # --- Remote Host ---
-    SetEnvIfNoCase Remote_Host "(163data|amazonaws|colocrossing|crimea|g00g1e|justhost|kanagawa|loopia|masterhost|onlinehome|poneytel|sprintdatacenter|reverse\.softlayer|safenet|ttnet|woodpecker|wowrack)" block_8g
+ # --- Remote Host ---
+ SetEnvIfNoCase Remote_Host "(163data|amazonaws|colocrossing|crimea|g00g1e|justhost|kanagawa|loopia|masterhost|onlinehome|poneytel|sprintdatacenter|reverse\.softlayer|safenet|ttnet|woodpecker|wowrack)" block_8g
 
-    # --- HTTP Referer ---
-    SetEnvIfNoCase Referer "(order(\s|%20)by(\s|%20)1--|@unlink|assert\(|print_r\(|\\x00|%00|xbshell|100dollars|best-seo|blue\spill|cocaine|ejaculat|erectile|erections|hoodia|huronriveracres|impotence|levitra|libido|lipitor|mopub\.com|phentermin|pornhelm|pro[sz]ac|sandyauer|semalt\.com|social-buttions|todaperfeita|tramadol|troyhamby|ultram|unicauca|valium|viagra|vicodin|xanax|ypxaieo)" block_8g
+ # --- HTTP Referer ---
+ SetEnvIfNoCase Referer "(order(\s|%20)by(\s|%20)1--|@unlink|assert\(|\x00|%00|xbshell|100dollars|best-seo|blue\spill|cocaine|ejaculat|erectile|erections|hoodia|huronriveracres|impotence|levitra|libido|lipitor|mopub\.com|phentermin|pornhelm|pro[sz]ac|sandyauer|semalt\.com|social-buttions|todaperfeita|tramadol|troyhamby|ultram|unicauca|valium|viagra|vicodin|xanax|ypxaieo)" block_8g
 
-    # --- User Agent (Classic Bad Bots) ---
-    SetEnvIfNoCase User-Agent "[a-z0-9]{2000,}" block_8g
-    SetEnvIfNoCase User-Agent '<|%0a|%0d|%27|%3c|%3e|%00|0x00|"|\\"' block_8g
-    SetEnvIfNoCase User-Agent "ahrefs|archiver|curl|libwww-perl|pycurl|scan" block_8g
-    SetEnvIfNoCase User-Agent "oppo a33|(c99|php|web)shell|site(.{0,2})copier" block_8g
-    SetEnvIfNoCase User-Agent "base64_decode|bin/bash|disconnect|eval|unserializ" block_8g
-    SetEnvIfNoCase User-Agent "acapbot|acoonbot|alexibot|antbot|asterias|attackbot|awario|babbar|backdor|barkrowler|becomebot|binlar|bitsightbot|blackwidow|blekkobot|blex|blowfish|bullseye|bunnys|butterfly|bytespider|careerbot|casper|censysinspect" block_8g
-    SetEnvIfNoCase User-Agent "checkpriv|cheesebot|cherrypick|chinaclaw|choppy|claudebot|clshttp|cmsworld|commoncrawl|copernic|copyrightcheck|cosmos|crawlergo|crescent|criteo|datacha|dataforseo|demon|diavol|discobot|dittospyder" block_8g
-    SetEnvIfNoCase User-Agent "dotbot|dotnetdotcom|dumbot|econtext|emailcollector|emailsiphon|emailwolf|eolasbot|eventures|extract|eyenetie|feedfinder|flaming|flashget|flicky|foobot|fuck" block_8g
-    SetEnvIfNoCase User-Agent "g00g1e|getright|gigabot|go-ahead-got|go-http-client|gozilla|grabnet|grafula|harvest|heritrix|hrankbot|httracks?|icarus6j|imagesiftbot|intelx|jetbot|jetcar|jikespider|kmccrew|leechftp|libweb|liebaofast" block_8g
-    SetEnvIfNoCase User-Agent "linkscan|linkwalker|lwp-download|majestic|masscan|mauibot|miner|mechanize|mj12bot|morfeus|moveoverbot|mozlila|netmechanic|netspider|nicerspro|nikto|ninja|nominet|nutch" block_8g
-    SetEnvIfNoCase User-Agent "octopus|pagegrabber|petalbot|planetwork|postrank|proximic|purebot|queryn|queryseeker|radian6|radiation|realdownload|remoteview|rogerbot|scan|scooter|scrapy|seekerspid" block_8g
-    SetEnvIfNoCase User-Agent "semalt|seokicks|seznambot|siclab|sindice|sistrix|sitebot|siteexplorer|sitesnagger|skygrid|smartdownload|snoopy|sosospider|spankbot|spbot|sqlmap|stackrambler|stripper|sucker|surftbot" block_8g
-    SetEnvIfNoCase User-Agent "sux0r|suzukacz|suzuran|takeout|teleport|telesoft|true_robots|turingos|turnit|tweetmemebot|vampire|vikspider|voideye|webleacher|webreaper|webstripper|webvac|webviewer|webwhacker|wellknownbot" block_8g
-    SetEnvIfNoCase User-Agent "winhttp|wwwoffle|woxbot|xaldon|xxxyy|yamanalab|yioopbot|yisouspider|youda|zeus|zmeu|zoominfobot|zune|zyborg" block_8g
+ # --- User Agent (Classic Bad Bots) ---
+ SetEnvIfNoCase User-Agent "[a-z0-9]{2000,}" block_8g
+ SetEnvIfNoCase User-Agent '<|%0a|%0d|%27|%3c|%3e|%00|0x00|"|\\"' block_8g
+ SetEnvIfNoCase User-Agent "ahrefs|archiver|curl|libwww-perl|pycurl|scan" block_8g
+ SetEnvIfNoCase User-Agent "oppo a33|(c99|php|web)shell|site(.{0,2})copier" block_8g
+ SetEnvIfNoCase User-Agent "base64_decode|bin/bash|disconnect|eval|unserializ" block_8g
+ SetEnvIfNoCase User-Agent "acapbot|acoonbot|alexibot|antbot|asterias|attackbot|awario|babbar|backdor|barkrowler|becomebot|binlar|bitsightbot|blackwidow|blekkobot|blex|blowfish|bullseye|bunnys|butterfly|bytespider|careerbot|casper|censysinspect" block_8g
+ SetEnvIfNoCase User-Agent "checkpriv|cheesebot|cherrypick|chinaclaw|choppy|claudebot|clshttp|cmsworld|commoncrawl|copernic|copyrightcheck|cosmos|crawlergo|crescent|criteo|datacha|dataforseo|demon|diavol|discobot|dittospyder" block_8g
+ SetEnvIfNoCase User-Agent "dotbot|dotnetdotcom|dumbot|econtext|emailcollector|emailsiphon|emailwolf|eolasbot|eventures|extract|eyenetie|feedfinder|flaming|flashget|flicky|foobot|fuck" block_8g
+ SetEnvIfNoCase User-Agent "g00g1e|getright|gigabot|go-ahead-got|go-http-client|gozilla|grabnet|grafula|harvest|heritrix|hrankbot|httracks?|icarus6j|imagesiftbot|intelx|jetbot|jetcar|jikespider|kmccrew|leechftp|libweb|liebaofast" block_8g
+ SetEnvIfNoCase User-Agent "linkscan|linkwalker|lwp-download|majestic|masscan|mauibot|miner|mechanize|mj12bot|morfeus|moveoverbot|mozlila|netmechanic|netspider|nicerspro|nikto|ninja|nominet|nutch" block_8g
+ SetEnvIfNoCase User-Agent "octopus|pagegrabber|petalbot|planetwork|postrank|proximic|purebot|queryn|queryseeker|radian6|radiation|realdownload|remoteview|rogerbot|scan|scooter|scrapy|seekerspid" block_8g
+ SetEnvIfNoCase User-Agent "semalt|seokicks|seznambot|siclab|sindice|sistrix|sitebot|siteexplorer|sitesnagger|skygrid|smartdownload|snoopy|sosospider|spankbot|spbot|sqlmap|stackrambler|stripper|sucker|surftbot" block_8g
+ SetEnvIfNoCase User-Agent "sux0r|suzukacz|suzuran|takeout|teleport|telesoft|true_robots|turingos|turnit|tweetmemebot|vampire|vikspider|voideye|webleacher|webreaper|webstripper|webvac|webviewer|webwhacker|wellknownbot" block_8g
+ SetEnvIfNoCase User-Agent "winhttp|wwwoffle|woxbot|xaldon|xxxyy|yamanalab|yioopbot|yisouspider|youda|zeus|zmeu|zoominfobot|zune|zyborg" block_8g
 
-    # --- User Agent (AI Bots) ---
-    SetEnvIfNoCase User-Agent "[.]ai|-ai|_ai|ai[.]|ai-|ai_|ai=|AddSearchBot|Agentic|AgentQL|Agent 3|Agent API|Agent-|AI Agent|AI Article Writer|AI Assistant|AI Chat|AI Content Detector|AI Detection|AI Dungeon" block_8g
-    SetEnvIfNoCase User-Agent "AI Journalist|AI Legion|AI RAG|AI Search|AI SEO Crawler|AI Training|AI Web|AI Writer|AI2|AIBot|aiHitBot|AIMatrix|Airesearch|AISearch|AITraining|Alexa|Alice Yandex|AliGenie|AliyunSec|Alpha AI" block_8g
-    SetEnvIfNoCase User-Agent "AlphaAI|Amazon|Amelia|AndersPinkBot|AndiBot|Anomura|Anonymous AI|Anthropic|AnyPicker|Anyword|Applebot|Aria AI|Aria Browse|Articoolo|Ask AI|Atlassian|AutoGen|Automated Writer|AutoML|Autonomous RAG" block_8g
-    SetEnvIfNoCase User-Agent "AutoRAG|Awario|AWS Trainium|Azure|BabyAGI|BabyCatAGI|BardBot|Basic RAG|Bedrock|Big Sur|Bigsur|Botsonic|Brightbot|Browser MCP Agent|Browser Use|BuddyBot|Bytebot|ByteDance|Bytespider|CarynAI" block_8g
-    SetEnvIfNoCase User-Agent "CatBoost|CC-Crawler|CCBot|Chai|Channel3Bot|Character|Charstar AI|Chatbot|Chatsonic|ChatUser|Chinchilla|Claude|ClearScope|Clearview|Cognitive AI|Cohere|Common Crawl|CommonCrawl|Compass|Content Harmony" block_8g
-    SetEnvIfNoCase User-Agent "Content King|Content Optimizer|Content Samurai|ContentAtScale|ContentBot|Contentedge|ContentShake|Conversion AI|Copilot|CopyAI|Copymatic|Copyscape|CoreWeave|Corrective RAG|Cotoyogi|CRAB|Crawl4AI|CrawlQ AI|Crawlspace|Crew AI" block_8g
-    SetEnvIfNoCase User-Agent "CrewAI|Crushon AI|Cypex|DALL-E|DarkBard|DarkBERT|DataFor|DataProvider|Datenbank Crawler|DeepAI|Deep AI|DeepL|DeepMind|Deep Research|DeepResearch|DeepSeek|Devin|Diffbot|Dolma|Doubao AI" block_8g
-    SetEnvIfNoCase User-Agent "DuckAssistBot|DuckDuckGo Chat|DuckDuckGo-Enhanced|Echobot|DuckDuckBot|Echobox|Elixir|FacebookBot|FacebookExternalHit|Factset|Falcon|FIRE-1|Firebase|Firecrawl|Flyriver|Frase AI|FriendlyCrawler|Gato|Gemini|Gemma|Gen AI" block_8g
-    SetEnvIfNoCase User-Agent "GenAI|Generative|Genspark|Gentoo-chat|Ghostwriter|GigaChat|GLM|GodMode|Goose|GPT|Grammarly|Grendizer|Grok|Groq|GT Bot|GTBot|GTP|Hemingway Editor|Hetzner|Hugging" block_8g
-    SetEnvIfNoCase User-Agent "Hunyuan|Hybrid Search RAG|Hypotenuse AI|iAsk|IbouBot|ICC-Crawler|Ideogram|ImageGen|Imagen|ImagesiftBot|ImageSpider|img2dataset|imgproxy|INK Editor|INKforall|Instructor|IntelliSeek|Inferkit|ISSCyberRiskCrawler|Janitor AI" block_8g
-    SetEnvIfNoCase User-Agent "Jasper|Jenni AI|Julius AI|Kafkai|Kaggle|Kangaroo|Keyword Density AI|Kimi|Klaviyo|Knowledge|KomoBot|Kruti|KunatoCrawler|LAIONDownloader|LangChain|Langfuse|Language AI|Le Chat|Lensa|Leonardo" block_8g
-    SetEnvIfNoCase User-Agent "Lightpanda|LightRAG|LinerBot|LinkupBot|LLaMA|LCC|LLM|Local RAG Agent|Lovable|Magistral|magpie-crawler|MAI-Image|Manus|MarketMuse|MBZUAI|Meltwater|Meta-AI|Meta-External|Meta-Webindexer|Meta AI" block_8g
-    SetEnvIfNoCase User-Agent "MetaAI|MetaTagBot|Middleware|Midjourney|Mini AGI|MiniMax|Mintlify|Mistral|Mixtral|model-training|Molmo|Monica|Nano|Narrative|NeevaBot|netEstate|Neural Text|NeuralSEO|NinjaAI|NodeZero" block_8g
-    SetEnvIfNoCase User-Agent "NotebookLM|Nova Act|NovaAct|Nytheon|OAI-SearchBot|OAI SearchBot|OASIS|Olivia|OLM|Omgili|Onyx|Open AI|Open Interpreter|OpenAGI|OpenAI|OpenBot|OpenInterpreter|OpenPi|OpenRouter|OpenText AI" block_8g
-    SetEnvIfNoCase User-Agent "Operator|Outwrite|OVHcloud|Owlin|Page Analyzer AI|PaLM 2|PanguBot|Panscient|Paperlibot|Paraphraser[.]io|peer39_crawler|Perflexity|Perplexity|Petal|Phind|PiplBot|Pixmo|Playwright|PoeBot|PoeSearchBot" block_8g
-    SetEnvIfNoCase User-Agent "Poggio|Poseidon|ProWritingAid|Proximic|PulsarRPA|Puppeteer|Python AI|Python lxml|PyTorch|Qualified|Quark|QuillBot|Qopywriter|Qwen|RAG Agent|RAG Azure AI|RAG Chatbot|RAG Database|RAG IS|RAG Pipeline" block_8g
-    SetEnvIfNoCase User-Agent "RAG Search|RAG with|RAG-|RAG_|Raptor|React Agent|Reasoning|Redis AI RAG|Reka Flash|Replicate|RobotSpider|RunPod|Rytr|SaplingAI|SBIntuitionsBot|Scala|Scalenut|Scrap|ScriptBook|Seekr" block_8g
-    SetEnvIfNoCase User-Agent "SEObot|SEO Content Machine|SEO Robot|SemrushBot|Sentibot|Serper|ShapBot|Sidetrade|Simplified AI|Sitefinity|Skydancer|Skyvern|SlickWrite|SmartBot|Sonic|Sora|Spider/2|SpiderCreator|Spin Rewrite|Spinbot" block_8g
-    SetEnvIfNoCase User-Agent "Stability|Stable Diffusion|StableDiffusionBot|Stagehand|Stealth|Sudowrite|SummalyBot|Super Agent|Superagent|SuperAGI|Surfer AI|Taiko|TavilyBot|TerraCotta|Text Blaze|TextCortex|Thinkbot|Thordata|TikTokSpider|Timpibot" block_8g
-    SetEnvIfNoCase User-Agent "Tinybird|Together|Traefik|Tulu|Tülu|TurnitinBot|TwinAgent|uAgents|UI-TARS|VelenPublicWebCrawler|Venus Chub AI|Vidnami AI|Vision RAG|WARDBot|WebSurfer|WebText|WebVoyager|Webzio|WeChat|Whisper" block_8g
-    SetEnvIfNoCase User-Agent "WordAI|Wordtune|WPBot|Writecream|WriterZen|Writescope|Writesonic|WRTNBot|xAI|Xanthorox|xBot|XLNet|YaK|YaML|YandexAdditional|YouBot|Zanista|Zendesk|Zero|Zhipu" block_8g
-    SetEnvIfNoCase User-Agent "Zhuque AI|Zimm" block_8g
+ # --- User Agent (AI Bots) ---
+ SetEnvIfNoCase User-Agent "\.ai|-ai|_ai|ai\.|ai-|ai_|ai=|AddSearchBot|Agentic|AgentQL|Agent 3|Agent API|Agent-|AI Agent|AI Article Writer|AI Assistant|AI Chat|AI Content Detector|AI Detection|AI Dungeon" block_8g
+ SetEnvIfNoCase User-Agent "AI Journalist|AI Legion|AI RAG|AI Search|AI SEO Crawler|AI Training|AI Web|AI Writer|AI2|AIBot|aiHitBot|AIMatrix|Airesearch|AISearch|AITraining|Alexa|Alice Yandex|AliGenie|AliyunSec|Alpha AI" block_8g
+ SetEnvIfNoCase User-Agent "AlphaAI|Amazon|Amelia|AndersPinkBot|AndiBot|Anomura|Anonymous AI|Anthropic|AnyPicker|Anyword|Applebot|Aria AI|Aria Browse|Articoolo|Ask AI|Atlassian|AutoGen|Automated Writer|AutoML|Autonomous RAG" block_8g
+ SetEnvIfNoCase User-Agent "AutoRAG|Awario|AWS Trainium|Azure|BabyAGI|BabyCatAGI|BardBot|Basic RAG|Bedrock|Big Sur|Bigsur|Botsonic|Brightbot|Browser MCP Agent|Browser Use|BuddyBot|Bytebot|ByteDance|Bytespider|CarynAI" block_8g
+ SetEnvIfNoCase User-Agent "CatBoost|CC-Crawler|CCBot|Chai|Channel3Bot|Character|Charstar AI|Chatbot|Chatsonic|ChatUser|Chinchilla|Claude|ClearScope|Clearview|Cognitive AI|Cohere|Common Crawl|CommonCrawl|Compass|Content Harmony" block_8g
+ SetEnvIfNoCase User-Agent "Content King|Content Optimizer|Content Samurai|ContentAtScale|ContentBot|Contentedge|ContentShake|Conversion AI|Copilot|CopyAI|Copymatic|Copyscape|CoreWeave|Corrective RAG|Cotoyogi|CRAB|Crawl4AI|CrawlQ AI|Crawlspace|Crew AI" block_8g
+ SetEnvIfNoCase User-Agent "CrewAI|Crushon AI|Cypex|DALL-E|DarkBard|DarkBERT|DataFor|DataProvider|Datenbank Crawler|DeepAI|Deep AI|DeepL|DeepMind|Deep Research|DeepResearch|DeepSeek|Devin|Diffbot|Dolma|Doubao AI" block_8g
+ SetEnvIfNoCase User-Agent "DuckAssistBot|DuckDuckGo Chat|DuckDuckGo-Enhanced|Echobot|DuckDuckBot|Echobox|Elixir|FacebookBot|FacebookExternalHit|Factset|Falcon|FIRE-1|Firebase|Firecrawl|Flyriver|Frase AI|FriendlyCrawler|Gato|Gemini|Gemma|Gen AI" block_8g
+ SetEnvIfNoCase User-Agent "GenAI|Generative|Genspark|Gentoo-chat|Ghostwriter|GigaChat|GLM|GodMode|Goose|GPT|Grammarly|Grendizer|Grok|Groq|GT Bot|GTBot|GTP|Hemingway Editor|Hetzner|Hugging" block_8g
+ SetEnvIfNoCase User-Agent "Hunyuan|Hybrid Search RAG|Hypotenuse AI|iAsk|IbouBot|ICC-Crawler|Ideogram|ImageGen|Imagen|ImagesiftBot|ImageSpider|img2dataset|imgproxy|INK Editor|INKforall|Instructor|IntelliSeek|Inferkit|ISSCyberRiskCrawler|Janitor AI" block_8g
+ SetEnvIfNoCase User-Agent "Jasper|Jenni AI|Julius AI|Kafkai|Kaggle|Kangaroo|Keyword Density AI|Kimi|Klaviyo|Knowledge|KomoBot|Kruti|KunatoCrawler|LAIONDownloader|LangChain|Langfuse|Language AI|Le Chat|Lensa|Leonardo" block_8g
+ SetEnvIfNoCase User-Agent "Lightpanda|LightRAG|LinerBot|LinkupBot|LLaMA|LCC|LLM|Local RAG Agent|Lovable|Magistral|magpie-crawler|MAI-Image|Manus|MarketMuse|MBZUAI|Meltwater|Meta-AI|Meta-External|Meta-Webindexer|Meta AI" block_8g
+ SetEnvIfNoCase User-Agent "MetaAI|MetaTagBot|Middleware|Midjourney|Mini AGI|MiniMax|Mintlify|Mistral|Mixtral|model-training|Molmo|Monica|Nano|Narrative|NeevaBot|netEstate|Neural Text|NeuralSEO|NinjaAI|NodeZero" block_8g
+ SetEnvIfNoCase User-Agent "NotebookLM|Nova Act|NovaAct|Nytheon|OAI-SearchBot|OAI SearchBot|OASIS|Olivia|OLM|Omgili|Onyx|Open AI|Open Interpreter|OpenAGI|OpenAI|OpenBot|OpenInterpreter|OpenPi|OpenRouter|OpenText AI" block_8g
+ SetEnvIfNoCase User-Agent "Operator|Outwrite|OVHcloud|Owlin|Page Analyzer AI|PaLM 2|PanguBot|Panscient|Paperlibot|Paraphraser[.]io|peer39_crawler|Perflexity|Perplexity|Petal|Phind|PiplBot|Pixmo|Playwright|PoeBot|PoeSearchBot" block_8g
+ SetEnvIfNoCase User-Agent "Poggio|Poseidon|ProWritingAid|Proximic|PulsarRPA|Puppeteer|Python AI|Python lxml|PyTorch|Qualified|Quark|QuillBot|Qopywriter|Qwen|RAG Agent|RAG Azure AI|RAG Chatbot|RAG Database|RAG IS|RAG Pipeline" block_8g
+ SetEnvIfNoCase User-Agent "RAG Search|RAG with|RAG-|RAG_|Raptor|React Agent|Reasoning|Redis AI RAG|Reka Flash|Replicate|RobotSpider|RunPod|Rytr|SaplingAI|SBIntuitionsBot|Scala|Scalenut|Scrap|ScriptBook|Seekr" block_8g
+ SetEnvIfNoCase User-Agent "SEObot|SEO Content Machine|SEO Robot|SemrushBot|Sentibot|Serper|ShapBot|Sidetrade|Simplified AI|Sitefinity|Skydancer|Skyvern|SlickWrite|SmartBot|Sonic|Sora|Spider/2|SpiderCreator|Spin Rewrite|Spinbot" block_8g
+ SetEnvIfNoCase User-Agent "Stability|Stable Diffusion|StableDiffusionBot|Stagehand|Stealth|Sudowrite|SummalyBot|Super Agent|Superagent|SuperAGI|Surfer AI|Taiko|TavilyBot|TerraCotta|Text Blaze|TextCortex|Thinkbot|Thordata|TikTokSpider|Timpibot" block_8g
+ SetEnvIfNoCase User-Agent "Tinybird|Together|Traefik|Tulu|Tülu|TurnitinBot|TwinAgent|uAgents|UI-TARS|VelenPublicWebCrawler|Venus Chub AI|Vidnami AI|Vision RAG|WARDBot|WebSurfer|WebText|WebVoyager|Webzio|WeChat|Whisper" block_8g
+ SetEnvIfNoCase User-Agent "WordAI|Wordtune|WPBot|Writecream|WriterZen|Writescope|Writesonic|WRTNBot|xAI|Xanthorox|xBot|XLNet|YaK|YaML|YandexAdditional|YouBot|Zanista|Zendesk|Zero|Zhipu" block_8g
+ SetEnvIfNoCase User-Agent "Zhuque AI|Zimm" block_8g
+APACHE_EOF
+}
 
-</IfModule>
-
+apache_access_control() {
+    cat <<'APACHE_EOF'
 # --------------------------------------------
 # PART B: Global Access Control
 # --------------------------------------------
-<IfModule mod_authz_core.c>
-    <Location />
-        <RequireAll>
-            Require all granted
-            Require not env block_8g
-        </RequireAll>
-    </Location>
-</IfModule>
+
+<RequireAll>
+ Require all granted
+ Require not env block_8g
+</RequireAll>
 
 <IfModule !mod_authz_core.c>
-    <IfModule mod_access_compat.c>
-        <Location />
-            Order allow,deny
-            Allow from all
-            Deny from env=block_8g
-        </Location>
-    </IfModule>
+ Order allow,deny
+ Allow from all
+ Deny from env=block_8g
 </IfModule>
+APACHE_EOF
+}
 
-# --------------------------------------------
-# PART C: Original 8G mod_rewrite Rules
-# RewriteOptions InheritDown = Apache 2.4.8+ applies to all vhosts
-# --------------------------------------------
+rewrite_rules() {
+    cat <<'REWRITE_EOF'
 # 8G FIREWALL v1.5 20250927
 # https://perishablepress.com/8g-firewall/
-
-# Addon available: Block AI Bots
-# https://perishablepress.com/ultimate-ai-block-list/
+# Addon: Block AI Bots - https://perishablepress.com/ultimate-ai-block-list/
 
 # 8G:[CORE]
-#ServerSignature Off
-#Options -Indexes
-RewriteEngine On
-    RewriteOptions InheritDown
-#RewriteBase /
-
-<IfModule mod_rewrite.c>
-
-
-        RewriteCond %{QUERY_STRING} ^(%2d|-)[^=]+$ [NC,OR]
-        RewriteCond %{QUERY_STRING} ([a-z0-9]{4000,}) [NC,OR]
-        RewriteCond %{QUERY_STRING} (/|%2f)(:|%3a)(/|%2f) [NC,OR]
-        RewriteCond %{QUERY_STRING} (etc/(hosts|motd|shadow)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (order(\s|%20)by(\s|%20)1--) [NC,OR]
-        RewriteCond %{QUERY_STRING} (/|%2f)(\*|%2a)(\*|%2a)(/|%2f) [NC,OR]
-        RewriteCond %{QUERY_STRING} (`|<|>|\^|\|\\|0x00|%00|%0d%0a) [NC,OR]
-        RewriteCond %{QUERY_STRING} (f?ckfinder|f?ckeditor|fullclick) [NC,OR]
-        RewriteCond %{QUERY_STRING} ((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
-        RewriteCond %{QUERY_STRING} (localhost|127(\.|%2e)0(\.|%2e)0(\.|%2e)1) [NC,OR]
-        RewriteCond %{QUERY_STRING} (cmd|command)(=|%3d)(chdir|mkdir)(.*)(x20) [NC,OR]
-        RewriteCond %{QUERY_STRING} (globals|mosconfig([a-z_]{1,22})|(?<!SAML)request)(=|\[) [NC,OR]
-        RewriteCond %{QUERY_STRING} (/|%2f)((wp-)?config)((\.|%2e)inc)?((\.|%2e)php) [NC,OR]
-        RewriteCond %{QUERY_STRING} (thumbs?(_editor|open)?|tim(thumbs?)?)((\.|%2e)php) [NC,OR]
-        RewriteCond %{QUERY_STRING} (absolute_|base|root_)(dir|path)(=|%3d)(ftp|https?) [NC,OR]
-        RewriteCond %{QUERY_STRING} (s)?(ftp|inurl|php)(s)?(:(/|%2f|%u2215)(/|%2f|%u2215)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\.|20)(get|the)(_|%5f)(permalink|posts_page_url)(\(|%28) [NC,OR]
-        RewriteCond %{QUERY_STRING} ((boot|win)((\.|%2e)ini)|etc(/|%2f)passwd|self(/|%2f)environ) [NC,OR]
-        RewriteCond %{QUERY_STRING} (((/|%2f){3,3})|((\.|%2e){3,3})|((\.|%2e){2,2})(/|%2f|%u2215)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (benchmark|exec|fopen|function|html)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
-        RewriteCond %{QUERY_STRING} (php)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) [NC,OR]
-        RewriteCond %{QUERY_STRING} (e|%65|%45)(v|%76|%56)(a|%61|%31)(l|%6c|%4c)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
-        RewriteCond %{QUERY_STRING} (/|%2f)(=|%3d|$&|_mm|cgi(\.|-)|inurl(:|%3a)(/|%2f)|(mod|path)(=|%3d)(\.|%2e)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (<|%3c)(.*)(e|%65|%45)(m|%6d|%4d)(b|%62|%42)(e|%65|%45)(d|%64|%44)(.*)(>|%3e) [NC,OR]
-        RewriteCond %{QUERY_STRING} (<|%3c)(.*)(i|%69|%49)(f|%66|%46)(r|%72|%52)(a|%61|%41)(m|%6d|%4d)(e|%65|%45)(.*)(>|%3e) [NC,OR]
-        RewriteCond %{QUERY_STRING} (<|%3c)(.*)(o|%4f|%6f)(b|%62|%42)(j|%4a|%6a)(e|%65|%45)(c|%63|%43)(t|%74|%54)(.*)(>|%3e) [NC,OR]
-        RewriteCond %{QUERY_STRING} (<|%3c)(.*)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(.*)(>|%3e) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\+|%2b|%20)(d|%64|%44)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(t|%74|%54)(e|%65|%45)(\+|%2b|%20) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\+|%2b|%20)(i|%69|%49)(n|%6e|%4e)(s|%73|%53)(e|%65|%45)(r|%72|%52)(t|%74|%54)(\+|%2b|%20) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\+|%2b|%20)(s|%73|%53)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(c|%63|%43)(t|%74|%54)(\+|%2b|%20) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\+|%2b|%20)(u|%75|%55)(p|%70|%50)(d|%64|%44)(a|%61|%41)(t|%74|%54)(e|%65|%45)(\+|%2b|%20) [NC,OR]
-        RewriteCond %{QUERY_STRING} (\\x00|(\"|%22|\'|%27)?0(\"|%22|\'|%27)?(=|%3d)(\"|%22|\'|%27)?0|cast(\(|%28)0x|or%201(=|%3d)1) [NC,OR]
-        RewriteCond %{QUERY_STRING} (g|%67|%47)(l|%6c|%4c)(o|%6f|%4f)(b|%62|%42)(a|%61|%41)(l|%6c|%4c)(s|%73|%53)(=|\[|%[0-9A-Z]{0,2}) [NC,OR]
-        RewriteCond %{QUERY_STRING} (_|%5f)(r|%72|%52)(e|%65|%45)(q|%71|%51)(u|%75|%55)(e|%65|%45)(s|%73|%53)(t|%74|%54)(=|\[|%[0-9A-Z]{2,}) [NC,OR]
-        RewriteCond %{QUERY_STRING} (j|%6a|%4a)(a|%61|%41)(v|%76|%56)(a|%61|%31)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(:|%3a)(.*)(;|%3b|\)|%29) [NC,OR]
-        RewriteCond %{QUERY_STRING} (b|%62|%42)(a|%61|%41)(s|%73|%53)(e|%65|%45)(6|%36)(4|%34)(_|%5f)(e|%65|%45|d|%64|%44)(e|%65|%45|n|%6e|%4e)(c|%63|%43)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(.*)(\()(.*)(\)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (@copy|\$_(files|get|post)|allow_url_(fopen|include)|auto_prepend_file|blexbot|browsersploit|call_user_func_array|(php|web)shell|curl(_exec|test)|disable_functions?|document_root) [NC,OR]
-        RewriteCond %{QUERY_STRING} (elastix|encodeuricom|exploit|fclose|fgets|file_put_contents|fputs|fsbuff|fsockopen|gethostbyname|grablogin|hmei7|hubs_post-cta|input_file|invokefunction|(\b)load_file|open_basedir|outfile|p3dlite) [NC,OR]
-        RewriteCond %{QUERY_STRING} (pass(=|%3d)shell|passthru|phpinfo|phpshells|popen|proc_open|quickbrute|remoteview|root_path|safe_mode|shell_exec|site((.){0,2})copier|sp_executesql|sux0r|trojan|udtudt|user_func_array|wget|wp_insert_user|xertive) [NC,OR]
-        RewriteCond %{QUERY_STRING} (;|<|>|\'|\"|\)|%0a|%0d|%22|%27|%3c|%3e|%00)(.*)(/\*|alter|base64|benchmark|cast|concat|convert|create|encode|declare|delay|delete|drop|hex|insert|load|md5|null|replace|request|script|select|set|sleep|truncate|unhex|update) [NC,OR]
-        RewriteCond %{QUERY_STRING} ((\+|%2b)(concat|delete|get|select|union)(\+|%2b)) [NC,OR]
-        RewriteCond %{QUERY_STRING} (union)(.*)(select)(.*)(\(|%28) [NC,OR]
-        RewriteCond %{QUERY_STRING} (concat|eval)(.*)(\(|%28) [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_QUERY_STRING:%1___%2___%3]
-
+RewriteCond %{QUERY_STRING} ^(%2d|-)[^=]+$ [NC,OR]
+RewriteCond %{QUERY_STRING} ([a-z0-9]{4000,}) [NC,OR]
+RewriteCond %{QUERY_STRING} (/|%2f)(:|%3a)(/|%2f) [NC,OR]
+RewriteCond %{QUERY_STRING} (etc/(hosts|motd|shadow)) [NC,OR]
+RewriteCond %{QUERY_STRING} (order(\s|%20)by(\s|%20)1--) [NC,OR]
+RewriteCond %{QUERY_STRING} (/|%2f)(\*|%2a)(\*|%2a)(/|%2f) [NC,OR]
+RewriteCond %{QUERY_STRING} (`|<|>|\^|\|\\|0x00|%00|%0d%0a) [NC,OR]
+RewriteCond %{QUERY_STRING} (f?ckfinder|f?ckeditor|fullclick) [NC,OR]
+RewriteCond %{QUERY_STRING} ((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
+RewriteCond %{QUERY_STRING} (localhost|127(\.|%2e)0(\.|%2e)0(\.|%2e)1) [NC,OR]
+RewriteCond %{QUERY_STRING} (cmd|command)(=|%3d)(chdir|mkdir)(.*)(x20) [NC,OR]
+RewriteCond %{QUERY_STRING} (globals|mosconfig([a-z_]{1,22})|(?|%3e) [NC,OR]
+RewriteCond %{QUERY_STRING} (<%3c)(.*)(i|%69|%49)(f|%66|%46)(r|%72|%52)(a|%61|%41)(m|%6d|%4d)(e|%65|%45)(.*)(>|%3e) [NC,OR]
+RewriteCond %{QUERY_STRING} (<%3c)(.*)(o|%4f|%6f)(b|%62|%42)(j|%4a|%6a)(e|%65|%45)(c|%63|%43)(t|%74|%54)(.*)(>|%3e) [NC,OR]
+RewriteCond %{QUERY_STRING} (<%3c)(.*)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(.*)(>|%3e) [NC,OR]
+RewriteCond %{QUERY_STRING} (\+|%2b|%20)(d|%64|%44)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(t|%74|%54)(e|%65|%45)(\+|%2b|%20) [NC,OR]
+RewriteCond %{QUERY_STRING} (\+|%2b|%20)(i|%69|%49)(n|%6e|%4e)(s|%73|%53)(e|%65|%45)(r|%72|%52)(t|%74|%54)(\+|%2b|%20) [NC,OR]
+RewriteCond %{QUERY_STRING} (\+|%2b|%20)(s|%73|%53)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(c|%63|%43)(t|%74|%54)(\+|%2b|%20) [NC,OR]
+RewriteCond %{QUERY_STRING} (\+|%2b|%20)(u|%75|%55)(p|%70|%50)(d|%64|%44)(a|%61|%41)(t|%74|%54)(e|%65|%45)(\+|%2b|%20) [NC,OR]
+RewriteCond %{QUERY_STRING} (\x00|("|%22|\'|%27)?0("|%22|\'|%27)?(=|%3d)("|%22|\'|%27)?0|cast(\(|%28)0x|or%201(=|%3d)1) [NC,OR]
+RewriteCond %{QUERY_STRING} (g|%67|%47)(l|%6c|%4c)(o|%6f|%4f)(b|%62|%42)(a|%61|%41)(l|%6c|%4c)(s|%73|%53)(=|\[|%[0-9A-Z]{0,2}) [NC,OR]
+RewriteCond %{QUERY_STRING} (_|%5f)(r|%72|%52)(e|%65|%45)(q|%71|%51)(u|%75|%55)(e|%65|%45)(s|%73|%53)(t|%74|%54)(=|\[|%[0-9A-Z]{2,}) [NC,OR]
+RewriteCond %{QUERY_STRING} (j|%6a|%4a)(a|%61|%41)(v|%76|%56)(a|%61|%31)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(:|%3a)(.*)(;|%3b|\)|%29) [NC,OR]
+RewriteCond %{QUERY_STRING} (b|%62|%42)(a|%61|%41)(s|%73|%53)(e|%65|%45)(6|%36)(4|%34)(_|%5f)(e|%65|%45|d|%64|%44)(e|%65|%45|n|%6e|%4e)(c|%63|%43)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(.*)(\()(.*)(\)) [NC,OR]
+RewriteCond %{QUERY_STRING} (@copy|\$_(files|get|post)|allow_url_(fopen|include)|auto_prepend_file|blexbot|browsersploit|call_user_func_array|(php|web)shell|curl(_exec|test)|disable_functions?|document_root) [NC,OR]
+RewriteCond %{QUERY_STRING} (elastix|encodeuricom|exploit|fclose|fgets|file_put_contents|fputs|fsbuff|fsockopen|gethostbyname|grablogin|hmei7|hubs_post-cta|input_file|invokefunction|(\b)load_file|open_basedir|outfile|p3dlite) [NC,OR]
+RewriteCond %{QUERY_STRING} (pass(=|%3d)shell|passthru|phpinfo|phpshells|popen|proc_open|quickbrute|remoteview|root_path|safe_mode|shell_exec|site((.){0,2})copier|sp_executesql|sux0r|trojan|udtudt|user_func_array|wget|wp_insert_user|xertive) [NC,OR]
+RewriteCond %{QUERY_STRING} (;|<|>|\'|"|\)|%0a|%0d|%22|%27|%3c|%3e|%00)(.*)(/\*|alter|base64|benchmark|cast|concat|convert|create|encode|declare|delay|delete|drop|hex|insert|load|md5|null|replace|request|script|select|set|sleep|truncate|unhex|update) [NC,OR]
+RewriteCond %{QUERY_STRING} ((\+|%2b)(concat|delete|get|select|union)(\+|%2b)) [NC,OR]
+RewriteCond %{QUERY_STRING} (union)(.*)(select)(.*)(\(|%28) [NC,OR]
+RewriteCond %{QUERY_STRING} (concat|eval)(.*)(\(|%28) [NC]
+RewriteRule .* - [F]
 
 # 8G:[REQUEST URI]
-
-        RewriteCond %{REQUEST_URI} (,,,) [NC,OR]
-        RewriteCond %{REQUEST_URI} (-------) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\^|`|<|>|\\|\|) [NC,OR]
-        RewriteCond %{REQUEST_URI} ([a-z0-9]{2000,}) [NC,OR]
-        RewriteCond %{REQUEST_URI} (=?\\(\'|%27)/?)(\.) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(\*|\"|\'|\.|,|&|&amp;?)/?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.)(php)(\()?([0-9]+)(\))?(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} /((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.(s?ftp-?)config|(s?ftp-?)config\.) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(f?ckfinder|fck/|fckeditor|fullclick) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)((force-)?download|framework/main)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\{0\}|\"?0\"?=\"?0|\(/\(|\.\.\.|\+\+\+|\\\") [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(vbull(etin)?|boards|vbforum|vbweb|webvb)(/)? [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.|20)(get|the)(_)(permalink|posts_page_url)(\() [NC,OR]
-        RewriteCond %{REQUEST_URI} (///|\?\?|/&&|/\*(.*)\*/|/:/|\\\\|0x00|%00|%0d%0a) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(cgi_?)?alfa(_?cgiapi|_?data|_?v[0-9]+)?(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (thumbs?(_editor|open)?|tim(thumbs?)?)((\.|%2e)php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)((boot)?_?admin(er|istrator|s)(_events)?)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/%7e)(root|ftp|bin|nobody|named|guest|logs|sshd)(/) [NC,OR]
-        RewriteCond %{REQUEST_URI} (archive|backup|db|master|sql|wp|www|wwwroot)\.(gz|zip) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(\.?mad|alpha|c99|php|web)?sh(3|e)ll([0-9]+|\w)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(admin-?|file-?)(upload)(bg|_?file|ify|svu|ye)?(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(etc|var)(/)(hidden|secret|shadow|ninja|passwd|tmp)(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (s)?(ftp|http|inurl|php)(s)?(:(/|%2f|%u2215)(/|%2f|%u2215)) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(=|\$&?|&?(pws|rk)=0|_mm|_vti_|cgi(\.|-)|(=|/|;|,)nt\.) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.)(ds_store|htaccess|htpasswd|init?|mysql-select-db)(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(bin)(/)(cc|chmod|chsh|cpp|echo|id|kill|mail|nasm|perl|ping|ps|python|tclsh)(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(::[0-9999]|%3a%3a[0-9999]|127\.0\.0\.1|ccx|localhost|makefile|pingserver|wwwroot)(/)? [NC,OR]
-        RewriteCond %{REQUEST_URI} ^(/)(123|backup|bak|beta|bkp|default|demo|dev(new|old)?|new-?site|null|old|old_files|old1)(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)?j((\s)+)?a((\s)+)?v((\s)+)?a((\s)+)?s((\s)+)?c((\s)+)?r((\s)+)?i((\s)+)?p((\s)+)?t((\s)+)?(%3a|:) [NC,OR]
-        RewriteCond %{REQUEST_URI} ^(/)(old-?site(back)?|old(web)?site(here)?|sites?|staging|undefined|wordpress([0-9]+)|wordpress-old)(/)?$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(filemanager|htdocs|httpdocs|https?|mailman|mailto|msoffice|undefined|var|vhosts|webmaster|www)(/) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\(null\)|\{\$itemURL\}|cast\(0x|echo(.*)kae|etc/passwd|eval\(|null(.*)null|open_basedir|self/environ|\+union\+all\+select) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(db-?|j-?|my(sql)?-?|setup-?|web-?|wp-?)?(admin-?)?(setup-?)?(conf\b|conf(ig)?)(uration)?(\.?bak|\.inc)?(\.inc|\.old|\.php|\.txt) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)((.*)crlf-?injection|(.*)xss-?protection|__(inc|jsc)|author-panel|cgi-bin|database|downloader|(db|mysql)-?admin)(/) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(haders|head|hello|helpear|incahe|includes?|indo(sec)?|infos?|ioptimizes?|jmail|js|king|kiss|kodox|kro|legion|libsoft)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(awstats|document_root|dologin\.action|error.log|extension/ext|htaccess\.|lib/php|listinfo|phpunit/php|remoteview|server/php|www\.root\.) [NC,OR]
-        RewriteCond %{REQUEST_URI} (base64_(en|de)code|benchmark|curl_exec|echr|eval|function|fwrite|(f|p)open|html|leak|passthru|p?fsockopen|phpinfo)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
-        RewriteCond %{REQUEST_URI} (posix_(kill|mkfifo|setpgid|setsid|setuid)|(child|proc)_(close|get_status|nice|open|terminate)|(shell_)?exec|system)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)((c99|php|web)?shell|crossdomain|fileditor|locus7|nstview|php(get|remoteview|writer)|r57|remview|sshphp|storm7|webadmin)(.*)(\.|%2e|\(|%28) [NC,OR]
-        RewriteCond %{REQUEST_URI} /((wp-)((201\d|202\d|[0-9]{2})|ad|admin(fx|rss|setup)|booking|confirm|crons|data|file|mail|one|plugins?|readindex|reset|setups?|story))(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(^$|-|\!|\w|\.(.*)|100|123|([^iI])?ndex|index\.php/index|3xp|777|7yn|90sec|99|active|aill|ajs\.delivery|al277|alexuse?|ali|allwrite)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(analyser|apache|apikey|apismtp|authenticat(e|ing)|autoload_classmap|backup(_index)?|bakup|bkht|black|bogel|bookmark|bypass|cachee?)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(clean|cm(d|s)|con|connector\.minimal|contexmini|contral|curl(test)?|data(base)?|db|db-cache|db-safe-mode|defau11|defau1t|dompdf|dst)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(elements|emails?|error.log|ecscache|edit-form|eval-stdin|evil|fbrrchive|filemga|filenetworks?|f0x|gank(\.php)?|gass|gel|guide)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(logo_img|lufix|mage|marg|mass|mide|moon|mssqli|mybak|myshe|mysql|mytag_js?|nasgor|newfile|news|nf_?tracking|nginx|ngoi|ohayo|old-?index)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(olux|owl|pekok|petx|php-?info|phpping|popup-pomo|priv|r3x|radio|rahma|randominit|readindex|readmy|reads|repair-?bak|robot(s\.txt)?|root)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(router|savepng|semayan|shell|shootme|sky|socket(c|i|iasrgasf)ontrol|sql(bak|_?dump)?|support|sym403|sys|system_log|test|tmp-?(uploads)?)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(traffic-advice|u2p|udd|ukauka|up__uzegp|up14|upa?|upxx?|vega|vip|vu(ln)?(\w)?|webroot|weki|wikindex|wordpress|wp_logns?|wp_wrong_datlib)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (/)(wp-?install|installation|wp(3|4|5|6)|wpfootes|wpzip|ws0|wsdl|wso(\w)?|www|(uploads|wp-admin)?xleet(-shell)?|xmlsrpc|xup|xxu|xxx|zibi|zipy)(\.php) [NC,OR]
-        RewriteCond %{REQUEST_URI} (bkv74|cachedsimilar|core-stab|crgrvnkb|ctivrc|deadcode|deathshop|dkiz|e7xue|eqxafaj90zir|exploits|ffmkpcal|filellli7|(fox|sid)wso|gel4y|goog1es|gvqqpinc) [NC,OR]
-        RewriteCond %{REQUEST_URI} (@md5|00.temp00|0byte|0d4y|0day|0xor|wso1337|1h6j5|3xp|40dd1d|4price|70bex?|a57bze893|abbrevsprl|abruzi|adminer|aqbmkwwx|archivarix|backdoor|beez5|bgvzc29) [NC,OR]
-        RewriteCond %{REQUEST_URI} (handler_to_code|hax(0|o)r|hmei7|hnap1|home_url=|ibqyiove|icxbsx|indoxploi|jahat|jijle3|kcrew|keywordspy|laobiao|lock360|longdog|marijuan|mod_(aratic|ariimag)) [NC,OR]
-        RewriteCond %{REQUEST_URI} (mobiquo|muiebl|nessus|osbxamip|phpunit|priv8|qcmpecgy|r3vn330|racrew|raiz0|reportserver|r00t|respectmus|rom2823|roseleif|sh3ll|site((.){0,2})copier|sqlpatch|sux0r) [NC,OR]
-        RewriteCond %{REQUEST_URI} (sym403|telerik|uddatasql|utchiha|visualfrontend|w0rm|wangdafa|wpyii2|wsoyanzo|x5cv|xattack|xbaner|xertive|xiaolei|xltavrat|xorz|xsamxad|xsvip|xxxs?s?|zabbix|zebda) [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.)(7z|ab4|ace|afm|alfa|as(h|m)x?|aspx?|aws|axd|bash|ba?k?|bat|bz2|cfg|cfml?|cgi|cms|conf\b|config|ctl|dat|db|dist|dll|eml|eng(ine)?|env|et2|exe|fec|fla|git(ignore)?)$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.)(hg|idea|inc|index|ini|inv|jar|jspa?|lib|local|log|lqd|make|mbf|mdb|mmw|mny|mod(ule)?|msi|old|one|orig|out|passwd|pdb|php\.(php|suspect(ed)?)|php([^\/])|phtml?|pl|profiles?)$ [NC,OR]
-        RewriteCond %{REQUEST_URI} (\.)(psd|pst|ptdb|production|pwd|py|qbb|qdf|rar|rdf|remote|save|sdb|sql|sh|soa|svn|swf|swl|swo|swp|stx|tar|tax|tgz?|theme|tls|tmb|tmd|wok|wow|xsd|xtmpl|xz|ya?ml|za|zlib)$ [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_REQUEST_URI:%1___%2___%3]
-
+RewriteCond %{REQUEST_URI} (,,,) [NC,OR]
+RewriteCond %{REQUEST_URI} (-------) [NC,OR]
+RewriteCond %{REQUEST_URI} (\^|`|<|>|\\|\\|) [NC,OR]
+RewriteCond %{REQUEST_URI} ([a-z0-9]{2000,}) [NC,OR]
+RewriteCond %{REQUEST_URI} (=?\(\'|%27)/?)(\.) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(\*|"|\'|\.|,|&|&?)/?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (\.)(php)(\()?([0-9]+)(\))?(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} /((.*)header:|(.*)set-cookie:(.*)=) [NC,OR]
+RewriteCond %{REQUEST_URI} (\.(s?ftp-?)config|(s?ftp-?)config\.) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(f?ckfinder|fck/|fckeditor|fullclick) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(admin-?|file-?)(upload)(bg|_?file|ify|svu|ye)?(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(etc|var)(/)(hidden|secret|shadow|ninja|passwd|tmp)(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (s)?(ftp|http|inurl|php)(s)?(:/|%2f|%u2215)(/|%2f|%u2215) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(=|\$&?|&?(pws|rk)=0|_mm|_vti_|cgi(\.|-)|(=|/|;|,)nt\.) [NC,OR]
+RewriteCond %{REQUEST_URI} (\.)(ds_store|htaccess|htpasswd|init?|mysql-select-db)(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(bin)(/)(cc|chmod|chsh|cpp|echo|id|kill|mail|nasm|perl|ping|ps|python|tclsh)(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(::[0-9999]|%3a%3a[0-9999]|127\.0\.0\.1|ccx|localhost|makefile|pingserver|wwwroot)(/)? [NC,OR]
+RewriteCond %{REQUEST_URI} ^(/)(123|backup|bak|beta|bkp|default|demo|dev(new|old)?|new-?site|null|old|old_files|old1)(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (/)?j((\s)+)?a((\s)+)?v((\s)+)?a((\s)+)?s((\s)+)?c((\s)+)?r((\s)+)?i((\s)+)?p((\s)+)?t((\s)+)?(%3a|:) [NC,OR]
+RewriteCond %{REQUEST_URI} ^(/)(old-?site(back)?|old(web)?site(here)?|sites?|staging|undefined|wordpress([0-9]+)|wordpress-old)(/)?$ [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(filemanager|htdocs|httpdocs|https?|mailman|mailto|msoffice|undefined|var|vhosts|webmaster|www)(/) [NC,OR]
+RewriteCond %{REQUEST_URI} (\(null\)|\{\$itemURL\}|cast\(0x|echo(.*)kae|etc/passwd|eval\(|null(.*)null|open_basedir|self/environ|\+union\+all\+select) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(db-?|j-?|my(sql)?-?|setup-?|web-?|wp-?)?(admin-?)?(setup-?)?(conf\b|conf(ig)?)(uration)?(\.?bak|\.inc)?(\.inc|\.old|\.php|\.txt) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(crlf-?injection|xss-?protection|__(inc|jsc)|author-panel|cgi-bin|database|downloader|(db|mysql)-?admin)(/) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(haders|head|hello|helpear|incahe|includes?|indo(sec)?|infos?|ioptimizes?|jmail|js|king|kiss|kodox|kro|legion|libsoft)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(awstats|document_root|dologin\.action|error\.log|extension/ext|htaccess\.|lib/php|listinfo|phpunit/php|remoteview|server/php|www\.root\.) [NC,OR]
+RewriteCond %{REQUEST_URI} (base64_(en|de)code|benchmark|curl_exec|echr|eval|function|fwrite|(f|p)open|html|leak|passthru|p?fsockopen|phpinfo)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
+RewriteCond %{REQUEST_URI} (posix_(kill|mkfifo|setpgid|setsid|setuid)|(child|proc)_(close|get_status|nice|open|terminate)|(shell_)?exec|system)(.*)(\(|%28)(.*)(\)|%29) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(c99|php|web)?shell|crossdomain|fileditor|locus7|nstview|php(get|remoteview|writer)|r57|remview|sshphp|storm7|webadmin)(.*)(\.|%2e|\(|%28) [NC,OR]
+RewriteCond %{REQUEST_URI} /((wp-)((201\d|202\d|[0-9]{2})|ad|admin(fx|rss|setup)|booking|confirm|crons|data|file|mail|one|plugins?|readindex|reset|setups?|story))(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(^$|-|\!|\w|\.(.*)|100|123|([^iI])?ndex|index\.php/index|3xp|777|7yn|90sec|99|active|aill|ajs\.delivery|al277|alexuse?|ali|allwrite)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(analyser|apache|apikey|apismtp|authenticat(e|ing)|autoload_classmap|backup(_index)?|bakup|bkht|black|bogel|bookmark|bypass|cachee?)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(clean|cm(d|s)|con|connector\.minimal|contexmini|contral|curl(test)?|data(base)?|db|db-cache|db-safe-mode|defau11|defau1t|dompdf|dst)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(elements|emails?|error\.log|ecscache|edit-form|eval-stdin|evil|fbrrchive|filemga|filenetworks?|f0x|gank(\.php)?|gass|gel|guide)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(logo_img|lufix|mage|marg|mass|mide|moon|mssqli|mybak|myshe|mysql|mytag_js?|nasgor|newfile|news|nf_?tracking|nginx|ngoi|ohayo|old-?index)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(olux|owl|pekok|petx|php-?info|phpping|popup-pomo|priv|r3x|radio|rahma|randominit|readindex|readmy|reads|repair-?bak|robot(s\.txt)?|root)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(router|savepng|semayan|shell|shootme|sky|socket(c|i|iasrgasf)ontrol|sql(bak|_?dump)?|support|sym403|sys|system_log|test|tmp-?(uploads)?)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(traffic-advice|u2p|udd|ukauka|up__uzegp|up14|upa?|upxx?|vega|vip|vu(ln)?(\w)?|webroot|weki|wikindex|wordpress|wp_logns?|wp_wrong_datlib)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (/)(wp-?install|installation|wp(3|4|5|6)|wpfootes|wpzip|ws0|wsdl|wso(\w)?|www|(uploads|wp-admin)?xleet(-shell)?|xmlsrpc|xup|xxu|xxx|zibi|zipy)(\.php) [NC,OR]
+RewriteCond %{REQUEST_URI} (bkv74|cachedsimilar|core-stab|crgrvnkb|ctivrc|deadcode|deathshop|dkiz|e7xue|eqxafaj90zir|exploits|ffmkpcal|filellli7|(fox|sid)wso|gel4y|goog1es|gvqqpinc) [NC,OR]
+RewriteCond %{REQUEST_URI} (@md5|00\.temp00|0byte|0d4y|0day|0xor|wso1337|1h6j5|3xp|40dd1d|4price|70bex?|a57bze893|abbrevsprl|abruzi|adminer|aqbmkwwx|archivarix|backdoor|beez5|bgvzc29) [NC,OR]
+RewriteCond %{REQUEST_URI} (handler_to_code|hax(0|o)r|hmei7|hnap1|home_url=|ibqyiove|icxbsx|indoxploi|jahat|jijle3|kcrew|keywordspy|laobiao|lock360|longdog|marijuan|mod_(aratic|ariimag)) [NC,OR]
+RewriteCond %{REQUEST_URI} (mobiquo|muiebl|nessus|osbxamip|phpunit|priv8|qcmpecgy|r3vn330|racrew|raiz0|reportserver|r00t|respectmus|rom2823|roseleif|sh3ll|site((.){0,2})copier|sqlpatch|sux0r) [NC,OR]
+RewriteCond %{REQUEST_URI} (sym403|telerik|uddatasql|utchiha|visualfrontend|w0rm|wangdafa|wpyii2|wsoyanzo|x5cv|xattack|xbaner|xertive|xiaolei|xltavrat|xorz|xsamxad|xsvip|xxxs?s?|zabbix|zebda) [NC,OR]
+RewriteCond %{REQUEST_URI} (\.)(7z|ab4|ace|afm|alfa|as(h|m)x?|aspx?|aws|axd|bash|ba?k?|bat|bz2|cfg|cfml?|cgi|cms|conf\b|config|ctl|dat|db|dist|dll|eml|eng(ine)?|env|et2|exe|fec|fla|git(ignore)?)$ [NC,OR]
+RewriteCond %{REQUEST_URI} (\.)(hg|idea|inc|index|ini|inv|jar|jspa?|lib|local|log|lqd|make|mbf|mdb|mmw|mny|mod(ule)?|msi|old|one|orig|out|passwd|pdb|php\.(php|suspect(ed)?)|php([^/])|phtml?|pl|profiles?)$ [NC,OR]
+RewriteCond %{REQUEST_URI} (\.)(psd|pst|ptdb|production|pwd|py|qbb|qdf|rar|rdf|remote|save|sdb|sql|sh|soa|svn|swf|swl|swo|swp|stx|tar|tax|tgz?|theme|tls|tmb|tmd|wok|wow|xsd|xtmpl|xz|ya?ml|za|zlib)$ [NC]
+RewriteRule .* - [F]
 
 # 8G:[USER AGENT]
-
-        RewriteCond %{HTTP_USER_AGENT} ([a-z0-9]{2000,}) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (&lt;|%0a|%0d|%27|%3c|%3e|%00|0x00|\\\x22|\\\") [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (ahrefs|archiver|curl|libwww-perl|pycurl|scan) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (oppo\sa33|(c99|php|web)shell|site((.){0,2})copier) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (base64_decode|bin/bash|disconnect|eval|unserializ) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (acapbot|acoonbot|alexibot|antbot|asterias|attackbot|awario|babbar|backdor|barkrowler|becomebot|binlar|bitsightbot|blackwidow|blekkobot|blex|blowfish|bullseye|bunnys|butterfly|bytespider|careerbot|casper|censysinspect) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (checkpriv|cheesebot|cherrypick|chinaclaw|choppy|claudebot|clshttp|cmsworld|commoncrawl|copernic|copyrightcheck|cosmos|crawlergo|crescent|criteo|datacha|dataforseo|(\b)demon(\b)|diavol|discobot|dittospyder) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (dotbot|dotnetdotcom|dumbot|econtext|emailcollector|emailsiphon|emailwolf|eolasbot|eventures|extract|eyenetie|feedfinder|flaming|flashget|flicky|foobot|fuck) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (g00g1e|getright|gigabot|go-ahead-got|go-http-client|gozilla|grabnet|grafula|harvest|heritrix|hrankbot|httracks?|icarus6j|imagesiftbot|intelx|jetbot|jetcar|jikespider|kmccrew|leechftp|libweb|liebaofast) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (linkscan|linkwalker|lwp-download|majestic|masscan|mauibot|miner|mechanize|mj12bot|morfeus|moveoverbot|mozlila|netmechanic|netspider|nicerspro|nikto|ninja|nominet|nutch) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (octopus|pagegrabber|petalbot|planetwork|postrank|proximic|purebot|queryn|queryseeker|radian6|radiation|realdownload|remoteview|rogerbot|scan|scooter|scrapy|seekerspid) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (semalt|seokicks|seznambot|siclab|sindice|sistrix|sitebot|siteexplorer|sitesnagger|skygrid|smartdownload|snoopy|sosospider|spankbot|spbot|sqlmap|stackrambler|stripper|sucker|surftbot) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (sux0r|suzukacz|suzuran|takeout|teleport|telesoft|true_robots|turingos|turnit|tweetmemebot|vampire|vikspider|voideye|webleacher|webreaper|webstripper|webvac|webviewer|webwhacker|wellknownbot) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (winhttp|wwwoffle|woxbot|xaldon|xxxyy|yamanalab|yioopbot|yisouspider|youda|zeus|zmeu|zoominfobot|zune|zyborg) [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_USER_AGENT:%1]
-
+RewriteCond %{HTTP_USER_AGENT} ([a-z0-9]{2000,}) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (<%0a|%0d|%27|%3c|%3e|%00|0x00|\\x22|\\") [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (ahrefs|archiver|curl|libwww-perl|pycurl|scan) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (oppo\sa33|(c99|php|web)shell|site((.){0,2})copier) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (base64_decode|bin/bash|disconnect|eval|unserializ) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (acapbot|acoonbot|alexibot|antbot|asterias|attackbot|awario|babbar|backdor|barkrowler|becomebot|binlar|bitsightbot|blackwidow|blekkobot|blex|blowfish|bullseye|bunnys|butterfly|bytespider|careerbot|casper|censysinspect) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (checkpriv|cheesebot|cherrypick|chinaclaw|choppy|claudebot|clshttp|cmsworld|commoncrawl|copernic|copyrightcheck|cosmos|crawlergo|crescent|criteo|datacha|dataforseo|(\b)demon(\b)|diavol|discobot|dittospyder) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (dotbot|dotnetdotcom|dumbot|econtext|emailcollector|emailsiphon|emailwolf|eolasbot|eventures|extract|eyenetie|feedfinder|flaming|flashget|flicky|foobot|fuck) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (g00g1e|getright|gigabot|go-ahead-got|go-http-client|gozilla|grabnet|grafula|harvest|heritrix|hrankbot|httracks?|icarus6j|imagesiftbot|intelx|jetbot|jetcar|jikespider|kmccrew|leechftp|libweb|liebaofast) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (linkscan|linkwalker|lwp-download|majestic|masscan|mauibot|miner|mechanize|mj12bot|morfeus|moveoverbot|mozlila|netmechanic|netspider|nicerspro|nikto|ninja|nominet|nutch) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (octopus|pagegrabber|petalbot|planetwork|postrank|proximic|purebot|queryn|queryseeker|radian6|radiation|realdownload|remoteview|rogerbot|scan|scooter|scrapy|seekerspid) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (semalt|seokicks|seznambot|siclab|sindice|sistrix|sitebot|siteexplorer|sitesnagger|skygrid|smartdownload|snoopy|sosospider|spankbot|spbot|sqlmap|stackrambler|stripper|sucker|surftbot) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (sux0r|suzukacz|suzuran|takeout|teleport|telesoft|true_robots|turingos|turnit|tweetmemebot|vampire|vikspider|voideye|webleacher|webreaper|webstripper|webvac|webviewer|webwhacker|wellknownbot) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (winhttp|wwwoffle|woxbot|xaldon|xxxyy|yamanalab|yioopbot|yisouspider|youda|zeus|zmeu|zoominfobot|zune|zyborg) [NC]
+RewriteRule .* - [F]
 
 # 8G:[REMOTE HOST]
-
-        RewriteCond %{REMOTE_HOST} (163data|amazonaws|colocrossing|crimea|g00g1e|justhost|kanagawa|loopia|masterhost|onlinehome|poneytel|sprintdatacenter|reverse.softlayer|safenet|ttnet|woodpecker|wowrack) [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_REMOTE_HOST:%1]
-
+RewriteCond %{REMOTE_HOST} (163data|amazonaws|colocrossing|crimea|g00g1e|justhost|kanagawa|loopia|masterhost|onlinehome|poneytel|sprintdatacenter|reverse.softlayer|safenet|ttnet|woodpecker|wowrack) [NC]
+RewriteRule .* - [F]
 
 # 8G:[HTTP REFERRER]
-
-        RewriteCond %{HTTP_REFERER} (order(\s|%20)by(\s|%20)1--) [NC,OR]
-        RewriteCond %{HTTP_REFERER} (@unlink|assert\(|print_r\(|\\x00|%00|xbshell) [NC,OR]
-        RewriteCond %{HTTP_REFERER} (100dollars|best-seo|blue\spill|cocaine|ejaculat|erectile|erections|hoodia|huronriveracres|impotence|levitra|libido|lipitor|mopub\.com|phentermin) [NC,OR]
-        RewriteCond %{HTTP_REFERER} (pornhelm|pro[sz]ac|sandyauer|semalt\.com|social-buttions|todaperfeita|tramadol|troyhamby|ultram|unicauca|valium|viagra|vicodin|xanax|ypxaieo) [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_HTTP_REFERRER:%1]
-
+RewriteCond %{HTTP_REFERER} (order(\s|%20)by(\s|%20)1--) [NC,OR]
+RewriteCond %{HTTP_REFERER} (@unlink|assert\(|\x00|%00|xbshell) [NC,OR]
+RewriteCond %{HTTP_REFERER} (100dollars|best-seo|blue\spill|cocaine|ejaculat|erectile|erections|hoodia|huronriveracres|impotence|levitra|libido|lipitor|mopub\.com|phentermin) [NC,OR]
+RewriteCond %{HTTP_REFERER} (pornhelm|pro[sz]ac|sandyauer|semalt\.com|social-buttions|todaperfeita|tramadol|troyhamby|ultram|unicauca|valium|viagra|vicodin|xanax|ypxaieo) [NC]
+RewriteRule .* - [F]
 
 # 8G:[HTTP COOKIE]
-
-        RewriteCond %{HTTP_COOKIE} (<|>|\'|%0A|%0D|%27|%00) [NC]
-
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_HTTP_COOKIE:%1]
-
+RewriteCond %{HTTP_COOKIE} (<%0A|%0D|%27|%00) [NC]
+RewriteRule .* - [F]
 
 # 8G:[REQUEST METHOD]
+RewriteCond %{REQUEST_METHOD} ^(connect|debug|move|trace|track) [NC]
+RewriteRule .* - [F]
 
-        RewriteCond %{REQUEST_METHOD} ^(connect|debug|move|trace|track) [NC]
+# AI Bots (additional)
+RewriteCond %{HTTP_USER_AGENT} (\.ai|-ai|_ai|ai\.|ai-|ai_|ai=|AddSearchBot|Agentic|AgentQL|Agent\ 3|Agent\ API|Agent-|AI\ Agent|AI\ Article\ Writer|AI\ Assistant|AI\ Chat|AI\ Content\ Detector|AI\ Detection|AI\ Dungeon) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (AI\ Journalist|AI\ Legion|AI\ RAG|AI\ Search|AI\ SEO\ Crawler|AI\ Training|AI\ Web|AI\ Writer|AI2|AIBot|aiHitBot|AIMatrix|Airesearch|AISearch|AITraining|Alexa|Alice\ Yandex|AliGenie|AliyunSec|Alpha\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (AlphaAI|Amazon|Amelia|AndersPinkBot|AndiBot|Anomura|Anonymous\ AI|Anthropic|AnyPicker|Anyword|Applebot|Aria\ AI|Aria\ Browse|Articoolo|Ask\ AI|Atlassian|AutoGen|Automated\ Writer|AutoML|Autonomous\ RAG) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (AutoRAG|Awario|AWS\ Trainium|Azure|BabyAGI|BabyCatAGI|BardBot|Basic\ RAG|Bedrock|Big\ Sur|Bigsur|Botsonic|Brightbot|Browser\ MCP\ Agent|Browser\ Use|BuddyBot|Bytebot|ByteDance|Bytespider|CarynAI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (CatBoost|CC-Crawler|CCBot|Chai|Channel3Bot|Character|Charstar\ AI|Chatbot|Chatsonic|ChatUser|Chinchilla|Claude|ClearScope|Clearview|Cognitive\ AI|Cohere|Common\ Crawl|CommonCrawl|Compass|Content\ Harmony) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Content\ King|Content\ Optimizer|Content\ Samurai|ContentAtScale|ContentBot|Contentedge|ContentShake|Conversion\ AI|Copilot|CopyAI|Copymatic|Copyscape|CoreWeave|Corrective\ RAG|Cotoyogi|CRAB|Crawl4AI|CrawlQ\ AI|Crawlspace|Crew\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (CrewAI|Crushon\ AI|Cypex|DALL-E|DarkBard|DarkBERT|DataFor|DataProvider|Datenbank\ Crawler|DeepAI|Deep\ AI|DeepL|DeepMind|Deep\ Research|DeepResearch|DeepSeek|Devin|Diffbot|Dolma|Doubao\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (DuckAssistBot|DuckDuckGo\ Chat|DuckDuckGo-Enhanced|Echobot|DuckDuckBot|Echobox|Elixir|FacebookBot|FacebookExternalHit|Factset|Falcon|FIRE-1|Firebase|Firecrawl|Flyriver|Frase\ AI|FriendlyCrawler|Gato|Gemini|Gemma|Gen\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (GenAI|Generative|Genspark|Gentoo-chat|Ghostwriter|GigaChat|GLM|GodMode|Goose|GPT|Grammarly|Grendizer|Grok|Groq|GT\ Bot|GTBot|GTP|Hemingway\ Editor|Hetzner|Hugging) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Hunyuan|Hybrid\ Search\ RAG|Hypotenuse\ AI|iAsk|IbouBot|ICC-Crawler|Ideogram|ImageGen|Imagen|ImagesiftBot|ImageSpider|img2dataset|imgproxy|INK\ Editor|INKforall|Instructor|IntelliSeek|Inferkit|ISSCyberRiskCrawler|Janitor\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Jasper|Jenni\ AI|Julius\ AI|Kafkai|Kaggle|Kangaroo|Keyword\ Density\ AI|Kimi|Klaviyo|Knowledge|KomoBot|Kruti|KunatoCrawler|LAIONDownloader|LangChain|Langfuse|Language\ AI|Le\ Chat|Lensa|Leonardo) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Lightpanda|LightRAG|LinerBot|LinkupBot|LLaMA|LCC|LLM|Local\ RAG\ Agent|Lovable|Magistral|magpie-crawler|MAI-Image|Manus|MarketMuse|MBZUAI|Meltwater|Meta-AI|Meta-External|Meta-Webindexer|Meta\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (MetaAI|MetaTagBot|Middleware|Midjourney|Mini\ AGI|MiniMax|Mintlify|Mistral|Mixtral|model-training|Molmo|Monica|Nano|Narrative|NeevaBot|netEstate|Neural\ Text|NeuralSEO|NinjaAI|NodeZero) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (NotebookLM|Nova\ Act|NovaAct|Nytheon|OAI-SearchBot|OAI\ SearchBot|OASIS|Olivia|OLM|Omgili|Onyx|Open\ AI|Open\ Interpreter|OpenAGI|OpenAI|OpenBot|OpenInterpreter|OpenPi|OpenRouter|OpenText\ AI) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Operator|Outwrite|OVHcloud|Owlin|Page\ Analyzer\ AI|PaLM\ 2|PanguBot|Panscient|Paperlibot|Paraphraser\.io|peer39_crawler|Perflexity|Perplexity|Petal|Phind|PiplBot|Pixmo|Playwright|PoeBot|PoeSearchBot) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Poggio|Poseidon|ProWritingAid|Proximic|PulsarRPA|Puppeteer|Python\ AI|Python\ lxml|PyTorch|Qualified|Quark|QuillBot|Qopywriter|Qwen|RAG\ Agent|RAG\ Azure\ AI|RAG\ Chatbot|RAG\ Database|RAG\ IS|RAG\ Pipeline) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (RAG\ Search|RAG\ with|RAG-|RAG_|Raptor|React\ Agent|Reasoning|Redis\ AI\ RAG|Reka\ Flash|Replicate|RobotSpider|RunPod|Rytr|SaplingAI|SBIntuitionsBot|Scala|Scalenut|Scrap|ScriptBook|Seekr) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (SEObot|SEO\ Content\ Machine|SEO\ Robot|SemrushBot|Sentibot|Serper|ShapBot|Sidetrade|Simplified\ AI|Sitefinity|Skydancer|Skyvern|SlickWrite|SmartBot|Sonic|Sora|Spider/2|SpiderCreator|Spin\ Rewrite|Spinbot) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Stability|Stable\ Diffusion|StableDiffusionBot|Stagehand|Stealth|Sudowrite|SummalyBot|Super\ Agent|Superagent|SuperAGI|Surfer\ AI|Taiko|TavilyBot|TerraCotta|Text\ Blaze|TextCortex|Thinkbot|Thordata|TikTokSpider|Timpibot) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Tinybird|Together|Traefik|Tulu|Tülu|TurnitinBot|TwinAgent|uAgents|UI-TARS|VelenPublicWebCrawler|Venus\ Chub\ AI|Vidnami\ AI|Vision\ RAG|WARDBot|WebSurfer|WebText|WebVoyager|Webzio|WeChat|Whisper) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (WordAI|Wordtune|WPBot|Writecream|WriterZen|Writescope|Writesonic|WRTNBot|xAI|Xanthorox|xBot|XLNet|YaK|YaML|YandexAdditional|YouBot|Zanista|Zendesk|Zero|Zhipu) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (Zhuque\ AI|Zimm) [NC]
+RewriteRule (.*) - [F,L]
 
-        RewriteRule .* - [F]
-
-        # RewriteRule .* /nG_log.php?log [END,NE,E=nG_REQUEST_METHOD:%1]
-
-
-
-        RewriteCond %{HTTP_USER_AGENT} (\.ai|-ai|_ai|ai\.|ai-|ai_|ai=|AddSearchBot|Agentic|AgentQL|Agent\ 3|Agent\ API|Agent-|AI\ Agent|AI\ Article\ Writer|AI\ Assistant|AI\ Chat|AI\ Content\ Detector|AI\ Detection|AI\ Dungeon) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (AI\ Journalist|AI\ Legion|AI\ RAG|AI\ Search|AI\ SEO\ Crawler|AI\ Training|AI\ Web|AI\ Writer|AI2|AIBot|aiHitBot|AIMatrix|Airesearch|AISearch|AITraining|Alexa|Alice\ Yandex|AliGenie|AliyunSec|Alpha\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (AlphaAI|Amazon|Amelia|AndersPinkBot|AndiBot|Anomura|Anonymous\ AI|Anthropic|AnyPicker|Anyword|Applebot|Aria\ AI|Aria\ Browse|Articoolo|Ask\ AI|Atlassian|AutoGen|Automated\ Writer|AutoML|Autonomous\ RAG) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (AutoRAG|Awario|AWS\ Trainium|Azure|BabyAGI|BabyCatAGI|BardBot|Basic\ RAG|Bedrock|Big\ Sur|Bigsur|Botsonic|Brightbot|Browser\ MCP\ Agent|Browser\ Use|BuddyBot|Bytebot|ByteDance|Bytespider|CarynAI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (CatBoost|CC-Crawler|CCBot|Chai|Channel3Bot|Character|Charstar\ AI|Chatbot|Chatsonic|ChatUser|Chinchilla|Claude|ClearScope|Clearview|Cognitive\ AI|Cohere|Common\ Crawl|CommonCrawl|Compass|Content\ Harmony) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Content\ King|Content\ Optimizer|Content\ Samurai|ContentAtScale|ContentBot|Contentedge|ContentShake|Conversion\ AI|Copilot|CopyAI|Copymatic|Copyscape|CoreWeave|Corrective\ RAG|Cotoyogi|CRAB|Crawl4AI|CrawlQ\ AI|Crawlspace|Crew\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (CrewAI|Crushon\ AI|Cypex|DALL-E|DarkBard|DarkBERT|DataFor|DataProvider|Datenbank\ Crawler|DeepAI|Deep\ AI|DeepL|DeepMind|Deep\ Research|DeepResearch|DeepSeek|Devin|Diffbot|Dolma|Doubao\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (DuckAssistBot|DuckDuckGo\ Chat|DuckDuckGo-Enhanced|Echobot|DuckDuckBot|Echobox|Elixir|FacebookBot|FacebookExternalHit|Factset|Falcon|FIRE-1|Firebase|Firecrawl|Flyriver|Frase\ AI|FriendlyCrawler|Gato|Gemini|Gemma|Gen\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (GenAI|Generative|Genspark|Gentoo-chat|Ghostwriter|GigaChat|GLM|GodMode|Goose|GPT|Grammarly|Grendizer|Grok|Groq|GT\ Bot|GTBot|GTP|Hemingway\ Editor|Hetzner|Hugging) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Hunyuan|Hybrid\ Search\ RAG|Hypotenuse\ AI|iAsk|IbouBot|ICC-Crawler|Ideogram|ImageGen|Imagen|ImagesiftBot|ImageSpider|img2dataset|imgproxy|INK\ Editor|INKforall|Instructor|IntelliSeek|Inferkit|ISSCyberRiskCrawler|Janitor\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Jasper|Jenni\ AI|Julius\ AI|Kafkai|Kaggle|Kangaroo|Keyword\ Density\ AI|Kimi|Klaviyo|Knowledge|KomoBot|Kruti|KunatoCrawler|LAIONDownloader|LangChain|Langfuse|Language\ AI|Le\ Chat|Lensa|Leonardo) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Lightpanda|LightRAG|LinerBot|LinkupBot|LLaMA|LCC|LLM|Local\ RAG\ Agent|Lovable|Magistral|magpie-crawler|MAI-Image|Manus|MarketMuse|MBZUAI|Meltwater|Meta-AI|Meta-External|Meta-Webindexer|Meta\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (MetaAI|MetaTagBot|Middleware|Midjourney|Mini\ AGI|MiniMax|Mintlify|Mistral|Mixtral|model-training|Molmo|Monica|Nano|Narrative|NeevaBot|netEstate|Neural\ Text|NeuralSEO|NinjaAI|NodeZero) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (NotebookLM|Nova\ Act|NovaAct|Nytheon|OAI-SearchBot|OAI\ SearchBot|OASIS|Olivia|OLM|Omgili|Onyx|Open\ AI|Open\ Interpreter|OpenAGI|OpenAI|OpenBot|OpenInterpreter|OpenPi|OpenRouter|OpenText\ AI) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Operator|Outwrite|OVHcloud|Owlin|Page\ Analyzer\ AI|PaLM\ 2|PanguBot|Panscient|Paperlibot|Paraphraser\.io|peer39_crawler|Perflexity|Perplexity|Petal|Phind|PiplBot|Pixmo|Playwright|PoeBot|PoeSearchBot) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Poggio|Poseidon|ProWritingAid|Proximic|PulsarRPA|Puppeteer|Python\ AI|Python\ lxml|PyTorch|Qualified|Quark|QuillBot|Qopywriter|Qwen|RAG\ Agent|RAG\ Azure\ AI|RAG\ Chatbot|RAG\ Database|RAG\ IS|RAG\ Pipeline) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (RAG\ Search|RAG\ with|RAG-|RAG_|Raptor|React\ Agent|Reasoning|Redis\ AI\ RAG|Reka\ Flash|Replicate|RobotSpider|RunPod|Rytr|SaplingAI|SBIntuitionsBot|Scala|Scalenut|Scrap|ScriptBook|Seekr) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (SEObot|SEO\ Content\ Machine|SEO\ Robot|SemrushBot|Sentibot|Serper|ShapBot|Sidetrade|Simplified\ AI|Sitefinity|Skydancer|Skyvern|SlickWrite|SmartBot|Sonic|Sora|Spider/2|SpiderCreator|Spin\ Rewrite|Spinbot) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Stability|Stable\ Diffusion|StableDiffusionBot|Stagehand|Stealth|Sudowrite|SummalyBot|Super\ Agent|Superagent|SuperAGI|Surfer\ AI|Taiko|TavilyBot|TerraCotta|Text\ Blaze|TextCortex|Thinkbot|Thordata|TikTokSpider|Timpibot) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Tinybird|Together|Traefik|Tulu|Tülu|TurnitinBot|TwinAgent|uAgents|UI-TARS|VelenPublicWebCrawler|Venus\ Chub\ AI|Vidnami\ AI|Vision\ RAG|WARDBot|WebSurfer|WebText|WebVoyager|Webzio|WeChat|Whisper) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (WordAI|Wordtune|WPBot|Writecream|WriterZen|Writescope|Writesonic|WRTNBot|xAI|Xanthorox|xBot|XLNet|YaK|YaML|YandexAdditional|YouBot|Zanista|Zendesk|Zero|Zhipu) [NC,OR]
-        RewriteCond %{HTTP_USER_AGENT} (Zhuque\ AI|Zimm) [NC]
-
-        RewriteRule (.*) - [F,L]
-
-        RewriteRule ^/(xmlrpc|wp-trackback)\.php - [F,L,NC]
-
-</IfModule>
-#===============================================================================
-# END 8G FIREWALL
-#===============================================================================
-8G_EOF
-
-    echo -e "${GREEN}[OK] 8G Firewall config created at $CUSTOM_CONF${NC}"
+RewriteRule ^/(xmlrpc|wp-trackback)\.php - [F,L,NC]
+REWRITE_EOF
 }
 
-update_httpd_conf() {
-    echo -e "${YELLOW}[INFO] Updating Apache configuration...${NC}"
-    
-    # Check if already included
-    if grep -q "8g-firewall.conf" "$APACHE_CONF" 2>/dev/null; then
-        echo -e "${YELLOW}[WARN] 8G Firewall Include already exists in $APACHE_CONF${NC}"
+nginx_maps() {
+    cat <<'NGINX_MAPS_EOF'
+# 8G Firewall v1.5 - Nginx Map Definitions (http context)
+# These maps set variables that are checked in server blocks
+
+map $http_user_agent $g8_bad_ua {
+    default 0;
+    "~*[a-z0-9]{2000,}" 1;
+    "~*<|%0a|%0d|%27|%3c|%3e|%00|0x00" 1;
+    "~*ahrefs|archiver|curl|libwww-perl|pycurl|scan" 1;
+    "~*oppo a33|(c99|php|web)shell|site(.{0,2})copier" 1;
+    "~*base64_decode|bin/bash|disconnect|eval|unserializ" 1;
+    "~*acapbot|acoonbot|alexibot|antbot|asterias|attackbot|awario|babbar|backdor|barkrowler|becomebot|binlar|bitsightbot|blackwidow|blekkobot|blex|blowfish|bullseye|bunnys|butterfly|bytespider|careerbot|casper|censysinspect" 1;
+    "~*checkpriv|cheesebot|cherrypick|chinaclaw|choppy|claudebot|clshttp|cmsworld|commoncrawl|copernic|copyrightcheck|cosmos|crawlergo|crescent|criteo|datacha|dataforseo|demon|diavol|discobot|dittospyder" 1;
+    "~*dotbot|dotnetdotcom|dumbot|econtext|emailcollector|emailsiphon|emailwolf|eolasbot|eventures|extract|eyenetie|feedfinder|flaming|flashget|flicky|foobot|fuck" 1;
+    "~*g00g1e|getright|gigabot|go-ahead-got|go-http-client|gozilla|grabnet|grafula|harvest|heritrix|hrankbot|httracks?|icarus6j|imagesiftbot|intelx|jetbot|jetcar|jikespider|kmccrew|leechftp|libweb|liebaofast" 1;
+    "~*linkscan|linkwalker|lwp-download|majestic|masscan|mauibot|miner|mechanize|mj12bot|morfeus|moveoverbot|mozlila|netmechanic|netspider|nicerspro|nikto|ninja|nominet|nutch" 1;
+    "~*octopus|pagegrabber|petalbot|planetwork|postrank|proximic|purebot|queryn|queryseeker|radian6|radiation|realdownload|remoteview|rogerbot|scan|scooter|scrapy|seekerspid" 1;
+    "~*semalt|seokicks|seznambot|siclab|sindice|sistrix|sitebot|siteexplorer|sitesnagger|skygrid|smartdownload|snoopy|sosospider|spankbot|spbot|sqlmap|stackrambler|stripper|sucker|surftbot" 1;
+    "~*sux0r|suzukacz|suzuran|takeout|teleport|telesoft|true_robots|turingos|turnit|tweetmemebot|vampire|vikspider|voideye|webleacher|webreaper|webstripper|webvac|webviewer|webwhacker|wellknownbot" 1;
+    "~*winhttp|wwwoffle|woxbot|xaldon|xxxyy|yamanalab|yioopbot|yisouspider|youda|zeus|zmeu|zoominfobot|zune|zyborg" 1;
+    "~*\\.ai|-ai|_ai|ai\\.|ai-|ai_|ai=|AddSearchBot|Agentic|AgentQL|Agent 3|Agent API|Agent-|AI Agent|AI Article Writer|AI Assistant|AI Chat|AI Content Detector|AI Detection|AI Dungeon" 1;
+    "~*AI Journalist|AI Legion|AI RAG|AI Search|AI SEO Crawler|AI Training|AI Web|AI Writer|AI2|AIBot|aiHitBot|AIMatrix|Airesearch|AISearch|AITraining|Alexa|Alice Yandex|AliGenie|AliyunSec|Alpha AI" 1;
+    "~*AlphaAI|Amazon|Amelia|AndersPinkBot|AndiBot|Anomura|Anonymous AI|Anthropic|AnyPicker|Anyword|Applebot|Aria AI|Aria Browse|Articoolo|Ask AI|Atlassian|AutoGen|Automated Writer|AutoML|Autonomous RAG" 1;
+    "~*AutoRAG|Awario|AWS Trainium|Azure|BabyAGI|BabyCatAGI|BardBot|Basic RAG|Bedrock|Big Sur|Bigsur|Botsonic|Brightbot|Browser MCP Agent|Browser Use|BuddyBot|Bytebot|ByteDance|Bytespider|CarynAI" 1;
+    "~*CatBoost|CC-Crawler|CCBot|Chai|Channel3Bot|Character|Charstar AI|Chatbot|Chatsonic|ChatUser|Chinchilla|Claude|ClearScope|Clearview|Cognitive AI|Cohere|Common Crawl|CommonCrawl|Compass|Content Harmony" 1;
+    "~*Content King|Content Optimizer|Content Samurai|ContentAtScale|ContentBot|Contentedge|ContentShake|Conversion AI|Copilot|CopyAI|Copymatic|Copyscape|CoreWeave|Corrective RAG|Cotoyogi|CRAB|Crawl4AI|CrawlQ AI|Crawlspace|Crew AI" 1;
+    "~*CrewAI|Crushon AI|Cypex|DALL-E|DarkBard|DarkBERT|DataFor|DataProvider|Datenbank Crawler|DeepAI|Deep AI|DeepL|DeepMind|Deep Research|DeepResearch|DeepSeek|Devin|Diffbot|Dolma|Doubao AI" 1;
+    "~*DuckAssistBot|DuckDuckGo Chat|DuckDuckGo-Enhanced|Echobot|DuckDuckBot|Echobox|Elixir|FacebookBot|FacebookExternalHit|Factset|Falcon|FIRE-1|Firebase|Firecrawl|Flyriver|Frase AI|FriendlyCrawler|Gato|Gemini|Gemma|Gen AI" 1;
+    "~*GenAI|Generative|Genspark|Gentoo-chat|Ghostwriter|GigaChat|GLM|GodMode|Goose|GPT|Grammarly|Grendizer|Grok|Groq|GT Bot|GTBot|GTP|Hemingway Editor|Hetzner|Hugging" 1;
+    "~*Hunyuan|Hybrid Search RAG|Hypotenuse AI|iAsk|IbouBot|ICC-Crawler|Ideogram|ImageGen|Imagen|ImagesiftBot|ImageSpider|img2dataset|imgproxy|INK Editor|INKforall|Instructor|IntelliSeek|Inferkit|ISSCyberRiskCrawler|Janitor AI" 1;
+    "~*Jasper|Jenni AI|Julius AI|Kafkai|Kaggle|Kangaroo|Keyword Density AI|Kimi|Klaviyo|Knowledge|KomoBot|Kruti|KunatoCrawler|LAIONDownloader|LangChain|Langfuse|Language AI|Le Chat|Lensa|Leonardo" 1;
+    "~*Lightpanda|LightRAG|LinerBot|LinkupBot|LLaMA|LCC|LLM|Local RAG Agent|Lovable|Magistral|magpie-crawler|MAI-Image|Manus|MarketMuse|MBZUAI|Meltwater|Meta-AI|Meta-External|Meta-Webindexer|Meta AI" 1;
+    "~*MetaAI|MetaTagBot|Middleware|Midjourney|Mini AGI|MiniMax|Mintlify|Mistral|Mixtral|model-training|Molmo|Monica|Nano|Narrative|NeevaBot|netEstate|Neural Text|NeuralSEO|NinjaAI|NodeZero" 1;
+    "~*NotebookLM|Nova Act|NovaAct|Nytheon|OAI-SearchBot|OAI SearchBot|OASIS|Olivia|OLM|Omgili|Onyx|Open AI|Open Interpreter|OpenAGI|OpenAI|OpenBot|OpenInterpreter|OpenPi|OpenRouter|OpenText AI" 1;
+    "~*Operator|Outwrite|OVHcloud|Owlin|Page Analyzer AI|PaLM 2|PanguBot|Panscient|Paperlibot|Paraphraser[.]io|peer39_crawler|Perflexity|Perplexity|Petal|Phind|PiplBot|Pixmo|Playwright|PoeBot|PoeSearchBot" 1;
+    "~*Poggio|Poseidon|ProWritingAid|Proximic|PulsarRPA|Puppeteer|Python AI|Python lxml|PyTorch|Qualified|Quark|QuillBot|Qopywriter|Qwen|RAG Agent|RAG Azure AI|RAG Chatbot|RAG Database|RAG IS|RAG Pipeline" 1;
+    "~*RAG Search|RAG with|RAG-|RAG_|Raptor|React Agent|Reasoning|Redis AI RAG|Reka Flash|Replicate|RobotSpider|RunPod|Rytr|SaplingAI|SBIntuitionsBot|Scala|Scalenut|Scrap|ScriptBook|Seekr" 1;
+    "~*SEObot|SEO Content Machine|SEO Robot|SemrushBot|Sentibot|Serper|ShapBot|Sidetrade|Simplified AI|Sitefinity|Skydancer|Skyvern|SlickWrite|SmartBot|Sonic|Sora|Spider/2|SpiderCreator|Spin Rewrite|Spinbot" 1;
+    "~*Stability|Stable Diffusion|StableDiffusionBot|Stagehand|Stealth|Sudowrite|SummalyBot|Super Agent|Superagent|SuperAGI|Surfer AI|Taiko|TavilyBot|TerraCotta|Text Blaze|TextCortex|Thinkbot|Thordata|TikTokSpider|Timpibot" 1;
+    "~*Tinybird|Together|Traefik|Tulu|Tülu|TurnitinBot|TwinAgent|uAgents|UI-TARS|VelenPublicWebCrawler|Venus Chub AI|Vidnami AI|Vision RAG|WARDBot|WebSurfer|WebText|WebVoyager|Webzio|WeChat|Whisper" 1;
+    "~*WordAI|Wordtune|WPBot|Writecream|WriterZen|Writescope|Writesonic|WRTNBot|xAI|Xanthorox|xBot|XLNet|YaK|YaML|YandexAdditional|YouBot|Zanista|Zendesk|Zero|Zhipu" 1;
+    "~*Zhuque AI|Zimm" 1;
+}
+
+map $http_referer $g8_bad_referer {
+    default 0;
+    "~*order(\\s|%20)by(\\s|%20)1--" 1;
+    "~*@unlink|assert\\(|\\x00|%00|xbshell" 1;
+    "~*100dollars|best-seo|blue\\s*pill|cocaine|ejaculat|erectile|erections|hoodia|huronriveracres|impotence|levitra|libido|lipitor|mopub\\.com|phentermin" 1;
+    "~*pornhelm|pro[sz]ac|sandyauer|semalt\\.com|social-buttions|todaperfeita|tramadol|troyhamby|ultram|unicauca|valium|viagra|vicodin|xanax|ypxaieo" 1;
+}
+
+map $request_method $g8_bad_method {
+    default 0;
+    "CONNECT" 1;
+    "DEBUG"   1;
+    "MOVE"    1;
+    "TRACE"   1;
+    "TRACK"   1;
+}
+
+map $http_cookie $g8_bad_cookie {
+    default 0;
+    "~*<|>|'|%0A|%0D|%27|%00" 1;
+}
+
+map $request_uri $g8_bad_uri {
+    default 0;
+    "~*(,,,)" 1;
+    "~*(-------)" 1;
+    "~*\\^|`|<>|\\\\|" 1;
+    "~*[a-z0-9]{2000,}" 1;
+    "~*=?\\(\\'|%27)/?)(\\.)" 1;
+    "~*(/)(\\*|\"|\\'|\\.|,|&|&?)/?$" 1;
+    "~*(\\.)(php)(\\()?([0-9]+)(\\))?(/)?$" 1;
+    "~*/((.*)header:|(.*)set-cookie:(.*)=)" 1;
+    "~*(\\.(s?ftp-?)config|(s?ftp-?)config\\.)" 1;
+    "~*(/)(f?ckfinder|fck/|fckeditor|fullclick)" 1;
+    "~*(/)(admin-?|file-?)(upload)(bg|_?file|ify|svu|ye)?(\\.php)" 1;
+    "~*(/)(etc|var)(/)(hidden|secret|shadow|ninja|passwd|tmp)(/)?$" 1;
+    "~*(s)?(ftp|http|inurl|php)(s)?(:/|%2f|%u2215)(/|%2f|%u2215)" 1;
+    "~*(/)(=|\\$&?|&?(pws|rk)=0|_mm|_vti_|cgi(\\.|-)|(=|/|;|,)nt\\.)" 1;
+    "~*(\\.)(ds_store|htaccess|htpasswd|init?|mysql-select-db)(/)?$" 1;
+    "~*(/)(bin)(/)(cc|chmod|chsh|cpp|echo|id|kill|mail|nasm|perl|ping|ps|python|tclsh)(/)?$" 1;
+    "~*(/)(::[0-9999]|%3a%3a[0-9999]|127\\.0\\.0\\.1|ccx|localhost|makefile|pingserver|wwwroot)(/)?" 1;
+    "~*^(/)(123|backup|bak|beta|bkp|default|demo|dev(new|old)?|new-?site|null|old|old_files|old1)(/)?$" 1;
+    "~*(/)?j((\\s)+)?a((\\s)+)?v((\\s)+)?a((\\s)+)?s((\\s)+)?c((\\s)+)?r((\\s)+)?i((\\s)+)?p((\\s)+)?t((\\s)+)?(%3a|:)" 1;
+    "~*^(/)(old-?site(back)?|old(web)?site(here)?|sites?|staging|undefined|wordpress([0-9]+)|wordpress-old)(/)?$" 1;
+    "~*(/)(filemanager|htdocs|httpdocs|https?|mailman|mailto|msoffice|undefined|var|vhosts|webmaster|www)(/)" 1;
+    "~*(\\(null\\)|\\{\\$itemURL\\}|cast\\(0x|echo(.*)kae|etc/passwd|eval\\(|null(.*)null|open_basedir|self/environ|\\+union\\+all\\+select)" 1;
+    "~*(/)(db-?|j-?|my(sql)?-?|setup-?|web-?|wp-?)?(admin-?)?(setup-?)?(conf\\b|conf(ig)?)(uration)?(\\.?bak|\\.inc)?(\\.inc|\\.old|\\.php|\\.txt)" 1;
+    "~*(/)(crlf-?injection|xss-?protection|__(inc|jsc)|author-panel|cgi-bin|database|downloader|(db|mysql)-?admin)(/)" 1;
+    "~*(/)(haders|head|hello|helpear|incahe|includes?|indo(sec)?|infos?|ioptimizes?|jmail|js|king|kiss|kodox|kro|legion|libsoft)(\\.php)" 1;
+    "~*(/)(awstats|document_root|dologin\\.action|error\\.log|extension/ext|htaccess\\.|lib/php|listinfo|phpunit/php|remoteview|server/php|www\\.root\\.)" 1;
+    "~*(base64_(en|de)code|benchmark|curl_exec|echr|eval|function|fwrite|(f|p)open|html|leak|passthru|p?fsockopen|phpinfo)(.*)(\\(|%28)(.*)(\\)|%29)" 1;
+    "~*(posix_(kill|mkfifo|setpgid|setsid|setuid)|(child|proc)_(close|get_status|nice|open|terminate)|(shell_)?exec|system)(.*)(\\(|%28)(.*)(\\)|%29)" 1;
+    "~*(/)(c99|php|web)?shell|crossdomain|fileditor|locus7|nstview|php(get|remoteview|writer)|r57|remview|sshphp|storm7|webadmin)(.*)(\\.|%2e|\\(|%28)" 1;
+    "~*/((wp-)((201\\d|202\\d|[0-9]{2})|ad|admin(fx|rss|setup)|booking|confirm|crons|data|file|mail|one|plugins?|readindex|reset|setups?|story))(\\.php)" 1;
+    "~*(/)(^$|-|\\!|\\w|\\.(.*)|100|123|([^iI])?ndex|index\\.php/index|3xp|777|7yn|90sec|99|active|aill|ajs\\.delivery|al277|alexuse?|ali|allwrite)(\\.php)" 1;
+    "~*(/)(analyser|apache|apikey|apismtp|authenticat(e|ing)|autoload_classmap|backup(_index)?|bakup|bkht|black|bogel|bookmark|bypass|cachee?)(\\.php)" 1;
+    "~*(/)(clean|cm(d|s)|con|connector\\.minimal|contexmini|contral|curl(test)?|data(base)?|db|db-cache|db-safe-mode|defau11|defau1t|dompdf|dst)(\\.php)" 1;
+    "~*(/)(elements|emails?|error\\.log|ecscache|edit-form|eval-stdin|evil|fbrrchive|filemga|filenetworks?|f0x|gank(\\.php)?|gass|gel|guide)(\\.php)" 1;
+    "~*(/)(logo_img|lufix|mage|marg|mass|mide|moon|mssqli|mybak|myshe|mysql|mytag_js?|nasgor|newfile|news|nf_?tracking|nginx|ngoi|ohayo|old-?index)(\\.php)" 1;
+    "~*(/)(olux|owl|pekok|petx|php-?info|phpping|popup-pomo|priv|r3x|radio|rahma|randominit|readindex|readmy|reads|repair-?bak|robot(s\\.txt)?|root)(\\.php)" 1;
+    "~*(/)(router|savepng|semayan|shell|shootme|sky|socket(c|i|iasrgasf)ontrol|sql(bak|_?dump)?|support|sym403|sys|system_log|test|tmp-?(uploads)?)(\\.php)" 1;
+    "~*(/)(traffic-advice|u2p|udd|ukauka|up__uzegp|up14|upa?|upxx?|vega|vip|vu(ln)?(\\w)?|webroot|weki|wikindex|wordpress|wp_logns?|wp_wrong_datlib)(\\.php)" 1;
+    "~*(/)(wp-?install|installation|wp(3|4|5|6)|wpfootes|wpzip|ws0|wsdl|wso(\\w)?|www|(uploads|wp-admin)?xleet(-shell)?|xmlsrpc|xup|xxu|xxx|zibi|zipy)(\\.php)" 1;
+    "~*(bkv74|cachedsimilar|core-stab|crgrvnkb|ctivrc|deadcode|deathshop|dkiz|e7xue|eqxafaj90zir|exploits|ffmkpcal|filellli7|(fox|sid)wso|gel4y|goog1es|gvqqpinc)" 1;
+    "~*(@md5|00\\.temp00|0byte|0d4y|0day|0xor|wso1337|1h6j5|3xp|40dd1d|4price|70bex?|a57bze893|abbrevsprl|abruzi|adminer|aqbmkwwx|archivarix|backdoor|beez5|bgvzc29)" 1;
+    "~*(handler_to_code|hax(0|o)r|hmei7|hnap1|home_url=|ibqyiove|icxbsx|indoxploi|jahat|jijle3|kcrew|keywordspy|laobiao|lock360|longdog|marijuan|mod_(aratic|ariimag))" 1;
+    "~*(mobiquo|muiebl|nessus|osbxamip|phpunit|priv8|qcmpecgy|r3vn330|racrew|raiz0|reportserver|r00t|respectmus|rom2823|roseleif|sh3ll|site((.){0,2})copier|sqlpatch|sux0r)" 1;
+    "~*(sym403|telerik|uddatasql|utchiha|visualfrontend|w0rm|wangdafa|wpyii2|wsoyanzo|x5cv|xattack|xbaner|xertive|xiaolei|xltavrat|xorz|xsamxad|xsvip|xxxs?s?|zabbix|zebda)" 1;
+    "~*(\\.)(7z|ab4|ace|afm|alfa|as(h|m)x?|aspx?|aws|axd|bash|ba?k?|bat|bz2|cfg|cfml?|cgi|cms|conf\\b|config|ctl|dat|db|dist|dll|eml|eng(ine)?|env|et2|exe|fec|fla|git(ignore)?)$" 1;
+    "~*(\\.)(hg|idea|inc|index|ini|inv|jar|jspa?|lib|local|log|lqd|make|mbf|mdb|mmw|mny|mod(ule)?|msi|old|one|orig|out|passwd|pdb|php\\.(php|suspect(ed)?)|php([^/])|phtml?|pl|profiles?)$" 1;
+    "~*(\\.)(psd|pst|ptdb|production|pwd|py|qbb|qdf|rar|rdf|remote|save|sdb|sql|sh|soa|svn|swf|swl|swo|swp|stx|tar|tax|tgz?|theme|tls|tmb|tmd|wok|wow|xsd|xtmpl|xz|ya?ml|za|zlib)$" 1;
+}
+
+map $args $g8_bad_query {
+    default 0;
+    "~*^(%2d|-)[^=]+$" 1;
+    "~*([a-z0-9]{4000,})" 1;
+    "~*(/|%2f)(:|%3a)(/|%2f)" 1;
+    "~*(etc/(hosts|motd|shadow))" 1;
+    "~*(order(\\s|%20)by(\\s|%20)1--)" 1;
+    "~*(/|%2f)(\\*|%2a)(\\*|%2a)(/|%2f)" 1;
+    "~*(`|<>|\\^|\\\\|0x00|%00|%0d%0a)" 1;
+    "~*(f?ckfinder|f?ckeditor|fullclick)" 1;
+    "~*((.*)header:|(.*)set-cookie:(.*)=)" 1;
+    "~*(localhost|127(\\.|%2e)0(\\.|%2e)0(\\.|%2e)1)" 1;
+    "~*(cmd|command)(=|%3d)(chdir|mkdir)(.*)(x20)" 1;
+    "~*(globals|mosconfig([a-z_]{1,22})|(?|%3e)" 1;
+    "~*(<%3c)(.*)(i|%69|%49)(f|%66|%46)(r|%72|%52)(a|%61|%41)(m|%6d|%4d)(e|%65|%45)(.*)(>|%3e)" 1;
+    "~*(<%3c)(.*)(o|%4f|%6f)(b|%62|%42)(j|%4a|%6a)(e|%65|%45)(c|%63|%43)(t|%74|%54)(.*)(>|%3e)" 1;
+    "~*(<%3c)(.*)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(.*)(>|%3e)" 1;
+    "~*(\\+|%2b|%20)(d|%64|%44)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(t|%74|%54)(e|%65|%45)(\\+|%2b|%20)" 1;
+    "~*(\\+|%2b|%20)(i|%69|%49)(n|%6e|%4e)(s|%73|%53)(e|%65|%45)(r|%72|%52)(t|%74|%54)(\\+|%2b|%20)" 1;
+    "~*(\\+|%2b|%20)(s|%73|%53)(e|%65|%45)(l|%6c|%4c)(e|%65|%45)(c|%63|%43)(t|%74|%54)(\\+|%2b|%20)" 1;
+    "~*(\\+|%2b|%20)(u|%75|%55)(p|%70|%50)(d|%64|%44)(a|%61|%41)(t|%74|%54)(e|%65|%45)(\\+|%2b|%20)" 1;
+    "~*(\\x00|(\"|%22|\\'|%27)?0(\"|%22|\\'|%27)?(=|%3d)(\"|%22|\\'|%27)?0|cast(\\(|%28)0x|or%201(=|%3d)1)" 1;
+    "~*(g|%67|%47)(l|%6c|%4c)(o|%6f|%4f)(b|%62|%42)(a|%61|%41)(l|%6c|%4c)(s|%73|%53)(=|\\[|%[0-9A-Z]{0,2})" 1;
+    "~*(_|%5f)(r|%72|%52)(e|%65|%45)(q|%71|%51)(u|%75|%55)(e|%65|%45)(s|%73|%53)(t|%74|%54)(=|\\[|%[0-9A-Z]{2,})" 1;
+    "~*(j|%6a|%4a)(a|%61|%41)(v|%76|%56)(a|%61|%31)(s|%73|%53)(c|%63|%43)(r|%72|%52)(i|%69|%49)(p|%70|%50)(t|%74|%54)(:|%3a)(.*)(;|%3b|\\)|%29)" 1;
+    "~*(b|%62|%42)(a|%61|%41)(s|%73|%53)(e|%65|%45)(6|%36)(4|%34)(_|%5f)(e|%65|%45|d|%64|%44)(e|%65|%45|n|%6e|%4e)(c|%63|%43)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(.*)(\\()(.*)(\\))" 1;
+    "~*(@copy|\\$_(files|get|post)|allow_url_(fopen|include)|auto_prepend_file|blexbot|browsersploit|call_user_func_array|(php|web)shell|curl(_exec|test)|disable_functions?|document_root)" 1;
+    "~*(elastix|encodeuricom|exploit|fclose|fgets|file_put_contents|fputs|fsbuff|fsockopen|gethostbyname|grablogin|hmei7|hubs_post-cta|input_file|invokefunction|(\\b)load_file|open_basedir|outfile|p3dlite)" 1;
+    "~*(pass(=|%3d)shell|passthru|phpinfo|phpshells|popen|proc_open|quickbrute|remoteview|root_path|safe_mode|shell_exec|site((.){0,2})copier|sp_executesql|sux0r|trojan|udtudt|user_func_array|wget|wp_insert_user|xertive)" 1;
+    "~*(;|<|>|\\'|\"|\\)|%0a|%0d|%22|%27|%3c|%3e|%00)(.*)(/\\*|alter|base64|benchmark|cast|concat|convert|create|encode|declare|delay|delete|drop|hex|insert|load|md5|null|replace|request|script|select|set|sleep|truncate|unhex|update)" 1;
+    "~*((\\+|%2b)(concat|delete|get|select|union)(\\+|%2b))" 1;
+    "~*(union)(.*)(select)(.*)(\\(|%28)" 1;
+    "~*(concat|eval)(.*)(\\(|%28)" 1;
+}
+NGINX_MAPS_EOF
+}
+
+nginx_server_rules() {
+    cat <<'NGINX_SERVER_EOF'
+# 8G Firewall - Server Context Rules
+# Include this file inside every server block, or use a global server include
+
+if ($g8_bad_ua)      { return 403; }
+if ($g8_bad_referer) { return 403; }
+if ($g8_bad_method)  { return 403; }
+if ($g8_bad_cookie)  { return 403; }
+if ($g8_bad_uri)     { return 403; }
+if ($g8_bad_query)   { return 403; }
+
+# Block xmlrpc and trackback
+location ~* ^/(xmlrpc|wp-trackback)\.php {
+    return 403;
+}
+NGINX_SERVER_EOF
+}
+
+#===============================================================================
+# INSTALLATION FUNCTIONS
+#===============================================================================
+
+install_cpanel_apache() {
+    local conf_file="/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+    local backup_file="${conf_file}.$(date +%Y%m%d-%H%M%S).bak"
+
+    echo -e "${YELLOW}[INFO] Installing for cPanel + Apache...${NC}"
+    mkdir -p "$(dirname "$conf_file")"
+    touch "$conf_file"
+
+    if grep -q "$MARKER_START" "$conf_file"; then
+        echo -e "${YELLOW}[WARN] 8G Firewall already installed in $conf_file${NC}"
         return 0
     fi
-    
-    # Find best insertion point - before first VirtualHost or Include
-    INSERT_LINE=$(grep -n -m1 -E '^\s*<VirtualHost|^\s*IncludeOptional\s|^\s*Include\s' "$APACHE_CONF" 2>/dev/null | head -1 | cut -d: -f1)
-    
-    if [ -z "$INSERT_LINE" ]; then
-        # No VirtualHost found, append before end
-        INSERT_LINE=$(wc -l < "$APACHE_CONF")
+
+    backup_file "$conf_file" "$backup_file"
+
+    {
+        echo ""
+        echo "$MARKER_START"
+        echo "# 8G Firewall v1.5 - cPanel + Apache"
+        echo "# $(date +%Y-%m-%d\ %H:%M:%S)"
+        apache_setenvif
+        apache_access_control
+        echo "RewriteEngine On"
+        echo "RewriteOptions InheritDown"
+        rewrite_rules
+        echo "$MARKER_END"
+    } >> "$conf_file"
+
+    echo -e "${GREEN}[OK] Rules appended to $conf_file${NC}"
+
+    echo -e "${YELLOW}[INFO] Testing Apache configuration...${NC}"
+    if apachectl configtest 2>&1; then
+        echo -e "${GREEN}[OK] Apache config test passed${NC}"
+    else
+        echo -e "${RED}[FAIL] Apache config test failed. Restoring backup...${NC}"
+        cp -a "$backup_file" "$conf_file"
+        exit 1
     fi
-    
-    # Create temp file with proper content
-    TMP_FILE=$(mktemp)
-    head -n $((INSERT_LINE - 1)) "$APACHE_CONF" > "$TMP_FILE"
-    echo "" >> "$TMP_FILE"
-    echo "# 8G FIREWALL GLOBAL INCLUDE - Added $(date +%Y-%m-%d)" >> "$TMP_FILE"
-    echo "Include $CUSTOM_CONF" >> "$TMP_FILE"
-    echo "" >> "$TMP_FILE"
-    tail -n +$INSERT_LINE "$APACHE_CONF" >> "$TMP_FILE"
-    
-    mv "$TMP_FILE" "$APACHE_CONF"
-    chmod 644 "$APACHE_CONF"
-    
-    echo -e "${GREEN}[OK] Added Include directive to $APACHE_CONF at line $INSERT_LINE${NC}"
+
+    echo -e "${YELLOW}[INFO] Rebuilding httpd configuration...${NC}"
+    /scripts/rebuildhttpdconf
+
+    echo -e "${YELLOW}[INFO] Restarting Apache...${NC}"
+    /scripts/restartsrv_httpd
+
+    echo -e "${GREEN}[OK] 8G Firewall installed for cPanel + Apache${NC}"
 }
 
-check_apache_syntax() {
-    echo -e "${YELLOW}[INFO] Checking Apache configuration syntax...${NC}"
-    
-    if $APACHE_BIN -t 2>&1; then
-        echo -e "${GREEN}[OK] Apache configuration syntax is valid${NC}"
+install_cpanel_litespeed() {
+    local conf_file="/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+    local backup_file="${conf_file}.$(date +%Y%m%d-%H%M%S).bak"
+
+    echo -e "${YELLOW}[INFO] Installing for cPanel + LiteSpeed...${NC}"
+    mkdir -p "$(dirname "$conf_file")"
+    touch "$conf_file"
+
+    if grep -q "$MARKER_START" "$conf_file"; then
+        echo -e "${YELLOW}[WARN] 8G Firewall already installed in $conf_file${NC}"
         return 0
+    fi
+
+    backup_file "$conf_file" "$backup_file"
+
+    {
+        echo ""
+        echo "$MARKER_START"
+        echo "# 8G Firewall v1.5 - cPanel + LiteSpeed"
+        echo "# $(date +%Y-%m-%d\ %H:%M:%S)"
+        apache_setenvif
+        apache_access_control
+        echo "RewriteEngine On"
+        echo "RewriteOptions InheritDown"
+        rewrite_rules
+        echo "$MARKER_END"
+    } >> "$conf_file"
+
+    echo -e "${GREEN}[OK] Rules appended to $conf_file${NC}"
+
+    echo -e "${YELLOW}[INFO] Testing configuration...${NC}"
+    if /usr/local/lsws/bin/lshttpd -t 2>&1 || apachectl configtest 2>&1; then
+        echo -e "${GREEN}[OK] Config test passed${NC}"
     else
-        echo -e "${RED}[FAIL] Apache configuration syntax error!${NC}"
-        echo -e "${YELLOW}[INFO] Restoring from backup...${NC}"
-        
-        LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/httpd.conf.backup.* 2>/dev/null | head -1)
-        if [ -n "$LATEST_BACKUP" ]; then
-            cp "$LATEST_BACKUP" "$APACHE_CONF"
-            echo -e "${GREEN}[OK] Restored from $LATEST_BACKUP${NC}"
-        fi
-        
-        return 1
+        echo -e "${RED}[FAIL] Config test failed. Restoring backup...${NC}"
+        cp -a "$backup_file" "$conf_file"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[INFO] Rebuilding configuration...${NC}"
+    /scripts/rebuildhttpdconf
+
+    echo -e "${YELLOW}[INFO] Restarting LiteSpeed...${NC}"
+    if systemctl restart lsws 2>/dev/null; then
+        echo -e "${GREEN}[OK] LiteSpeed restarted via systemctl${NC}"
+    elif service lsws restart 2>/dev/null; then
+        echo -e "${GREEN}[OK] LiteSpeed restarted via service${NC}"
+    elif /usr/local/lsws/bin/lswsctrl restart 2>/dev/null; then
+        echo -e "${GREEN}[OK] LiteSpeed restarted via lswsctrl${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Could not restart LiteSpeed automatically${NC}"
+    fi
+
+    echo -e "${GREEN}[OK] 8G Firewall installed for cPanel + LiteSpeed${NC}"
+}
+
+install_cpanel_nginx() {
+    local maps_file="/etc/nginx/conf.d/8g-firewall-maps.conf"
+    local server_file="/etc/nginx/conf.d/8g-firewall-server.conf"
+    local nginx_conf="/etc/nginx/nginx.conf"
+    local backup_maps="${maps_file}.$(date +%Y%m%d-%H%M%S).bak"
+    local backup_server="${server_file}.$(date +%Y%m%d-%H%M%S).bak"
+
+    echo -e "${YELLOW}[INFO] Installing for cPanel + ea-nginx...${NC}"
+
+    if [[ -f "$maps_file" ]]; then
+        backup_file "$maps_file" "$backup_maps"
+    fi
+    if [[ -f "$server_file" ]]; then
+        backup_file "$server_file" "$backup_server"
+    fi
+
+    nginx_maps > "$maps_file"
+    nginx_server_rules > "$server_file"
+
+    echo -e "${GREEN}[OK] Nginx map config: $maps_file${NC}"
+    echo -e "${GREEN}[OK] Nginx server config: $server_file${NC}"
+
+    # Try to auto-include in cPanel nginx template or existing configs
+    local template_dir="/var/cpanel/templates/nginx"
+    local included=0
+
+    if [[ -d "$template_dir" ]]; then
+        for tmpl in "$template_dir"/*.tmpl "$template_dir"/vhost/*.tmpl "$template_dir"/vhost.local/*.tmpl 2>/dev/null; do
+            [[ -f "$tmpl" ]] || continue
+            if ! grep -q "8g-firewall-server.conf" "$tmpl" 2>/dev/null; then
+                # Add include near the top of server block
+                if grep -q "server\s*{" "$tmpl" 2>/dev/null; then
+                    sed -i '/server\s*{/a\    include /etc/nginx/conf.d/8g-firewall-server.conf;' "$tmpl"
+                    echo -e "${GREEN}[OK] Added include to template: $tmpl${NC}"
+                    included=1
+                fi
+            fi
+        done
+    fi
+
+    # Also try to add to existing generated configs as a temporary measure
+    if [[ -d /etc/nginx/conf.d/users ]]; then
+        for user_conf in /etc/nginx/conf.d/users/*.conf; do
+            [[ -f "$user_conf" ]] || continue
+            if ! grep -q "8g-firewall-server.conf" "$user_conf" 2>/dev/null; then
+                sed -i '/server\s*{/a\    include /etc/nginx/conf.d/8g-firewall-server.conf;' "$user_conf"
+            fi
+        done
+    fi
+
+    echo -e "${YELLOW}[INFO] Testing nginx configuration...${NC}"
+    if nginx -t 2>&1; then
+        echo -e "${GREEN}[OK] Nginx config test passed${NC}"
+    else
+        echo -e "${RED}[FAIL] Nginx config test failed. Check syntax and restore backups if needed.${NC}"
+        echo -e "${YELLOW}Backups: $backup_maps, $backup_server${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[INFO] Reloading nginx...${NC}"
+    if /scripts/restartsrv_nginx 2>/dev/null; then
+        echo -e "${GREEN}[OK] Nginx reloaded${NC}"
+    elif systemctl reload nginx 2>/dev/null; then
+        echo -e "${GREEN}[OK] Nginx reloaded via systemctl${NC}"
+    elif service nginx reload 2>/dev/null; then
+        echo -e "${GREEN}[OK] Nginx reloaded via service${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Could not reload nginx automatically${NC}"
+    fi
+
+    echo -e "${GREEN}[OK] 8G Firewall installed for cPanel + nginx${NC}"
+    if [[ "$included" -eq 0 ]]; then
+        echo -e "${YELLOW}[NOTE] Could not auto-detect cPanel nginx template.${NC}"
+        echo -e "${YELLOW}       Add this line inside each server block:${NC}"
+        echo -e "${YELLOW}       include /etc/nginx/conf.d/8g-firewall-server.conf;${NC}"
     fi
 }
 
-reload_apache() {
-    echo -e "${YELLOW}[INFO] Reloading Apache...${NC}"
-    
-    if systemctl reload httpd 2>/dev/null || systemctl reload apache2 2>/dev/null; then
-        echo -e "${GREEN}[OK] Apache reloaded via systemctl${NC}"
-    elif service httpd reload 2>/dev/null || service apache2 reload 2>/dev/null; then
-        echo -e "${GREEN}[OK] Apache reloaded via service${NC}"
-    elif $APACHE_BIN -k graceful 2>/dev/null; then
-        echo -e "${GREEN}[OK] Apache reloaded gracefully${NC}"
+install_da_apache() {
+    local apache_bin=""
+    local apache_conf=""
+    local apache_extra=""
+    local custom_conf=""
+
+    echo -e "${YELLOW}[INFO] Installing for DirectAdmin + Apache...${NC}"
+
+    if [[ -f /usr/local/apache/bin/httpd ]]; then
+        apache_bin="/usr/local/apache/bin/httpd"
+        apache_conf="/usr/local/apache/conf/httpd.conf"
+        apache_extra="/usr/local/apache/conf/extra"
+        custom_conf="/usr/local/apache/conf/extra/8g-firewall.conf"
+    elif [[ -f /usr/sbin/httpd ]]; then
+        apache_bin="/usr/sbin/httpd"
+        apache_conf="/etc/httpd/conf/httpd.conf"
+        apache_extra="/etc/httpd/conf/extra"
+        custom_conf="/etc/httpd/conf/extra/8g-firewall.conf"
+    elif [[ -f /usr/local/apache2/bin/httpd ]]; then
+        apache_bin="/usr/local/apache2/bin/httpd"
+        apache_conf="/usr/local/apache2/conf/httpd.conf"
+        apache_extra="/usr/local/apache2/conf/extra"
+        custom_conf="/usr/local/apache2/conf/extra/8g-firewall.conf"
     else
-        echo -e "${YELLOW}[WARN] Could not reload automatically. Run: $APACHE_BIN -k graceful${NC}"
+        echo -e "${RED}Error: Apache binary not found${NC}"
+        exit 1
     fi
+
+    if [[ ! -f "$apache_conf" ]]; then
+        echo -e "${RED}Error: Apache config not found at $apache_conf${NC}"
+        exit 1
+    fi
+
+    mkdir -p "$apache_extra"
+
+    if [[ -f "$custom_conf" ]]; then
+        echo -e "${YELLOW}[WARN] 8G Firewall config already exists at $custom_conf${NC}"
+        return 0
+    fi
+
+    backup_file "$apache_conf" "$BACKUP_DIR/httpd.conf.$(date +%Y%m%d-%H%M%S).bak"
+
+    {
+        echo "$MARKER_START"
+        echo "# 8G Firewall v1.5 - DirectAdmin + Apache"
+        echo "# $(date +%Y-%m-%d\ %H:%M:%S)"
+        apache_setenvif
+        apache_access_control
+        echo "RewriteEngine On"
+        echo "RewriteOptions InheritDown"
+        rewrite_rules
+        echo "$MARKER_END"
+    } > "$custom_conf"
+
+    # Add Include to httpd.conf if not present
+    if ! grep -q "8g-firewall.conf" "$apache_conf" 2>/dev/null; then
+        echo "" >> "$apache_conf"
+        echo "# 8G Firewall Global Include" >> "$apache_conf"
+        echo "Include $custom_conf" >> "$apache_conf"
+        echo -e "${GREEN}[OK] Added Include to $apache_conf${NC}"
+    fi
+
+    echo -e "${YELLOW}[INFO] Testing Apache configuration...${NC}"
+    if $apache_bin -t 2>&1; then
+        echo -e "${GREEN}[OK] Apache config test passed${NC}"
+    else
+        echo -e "${RED}[FAIL] Apache config test failed. Restoring...${NC}"
+        sed -i "/8g-firewall.conf/d" "$apache_conf"
+        rm -f "$custom_conf"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[INFO] Rebuilding DirectAdmin configs...${NC}"
+    cd /usr/local/directadmin/custombuild
+    ./build rewrite_confs
+
+    echo -e "${YELLOW}[INFO] Restarting Apache...${NC}"
+    if systemctl restart httpd 2>/dev/null || systemctl restart apache2 2>/dev/null; then
+        echo -e "${GREEN}[OK] Apache restarted${NC}"
+    elif service httpd restart 2>/dev/null || service apache2 restart 2>/dev/null; then
+        echo -e "${GREEN}[OK] Apache restarted via service${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Could not restart Apache automatically${NC}"
+    fi
+
+    echo -e "${GREEN}[OK] 8G Firewall installed for DirectAdmin + Apache${NC}"
 }
 
-verify_mod_rewrite() {
-    echo -e "${YELLOW}[INFO] Checking mod_rewrite...${NC}"
-    
-    if $APACHE_BIN -M 2>/dev/null | grep -q "rewrite_module"; then
-        echo -e "${GREEN}[OK] mod_rewrite is enabled${NC}"
-    elif [ -d "$APACHE_CONF_D" ] && grep -r "rewrite_module" "$APACHE_CONF_D"/*.conf >/dev/null 2>&1; then
-        echo -e "${GREEN}[OK] mod_rewrite is loaded${NC}"
-    else
-        echo -e "${RED}[WARN] mod_rewrite may not be enabled!${NC}"
-        echo -e "${YELLOW}Enable with: cd /usr/local/directadmin/custombuild && ./build set mod_rewrite yes && ./build rewrite_confs${NC}"
+install_da_ols() {
+    local da_templates="/usr/local/directadmin/data/templates"
+    local da_custom="/usr/local/directadmin/data/templates/custom"
+    local custom_file="$da_custom/openlitespeed_vhost.conf.CUSTOM.5.pre"
+
+    echo -e "${YELLOW}[INFO] Installing for DirectAdmin + OpenLiteSpeed...${NC}"
+
+    if [[ ! -d "$da_templates" ]]; then
+        echo -e "${RED}Error: DirectAdmin templates not found${NC}"
+        exit 1
     fi
+
+    if [[ ! -f "$da_templates/openlitespeed_vhost.conf" ]]; then
+        echo -e "${RED}Error: OpenLiteSpeed template not found${NC}"
+        exit 1
+    fi
+
+    if [[ -f "$custom_file" ]]; then
+        echo -e "${YELLOW}[WARN] CUSTOM.5.pre already exists${NC}"
+        return 0
+    fi
+
+    mkdir -p "$da_custom"
+    backup_file "$custom_file" "$BACKUP_DIR/8g-ols-custom5.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+
+    {
+        echo "$MARKER_START"
+        echo "# 8G Firewall v1.5 - DirectAdmin + OpenLiteSpeed"
+        echo "# Position: CUSTOM.5 (inside rewrite block)"
+        echo "# $(date +%Y-%m-%d\ %H:%M:%S)"
+        rewrite_rules
+        echo "$MARKER_END"
+    } > "$custom_file"
+
+    chown diradmin:diradmin "$custom_file"
+    chmod 644 "$custom_file"
+
+    echo -e "${GREEN}[OK] Created: $custom_file${NC}"
+
+    echo -e "${YELLOW}[INFO] Rebuilding OLS configs...${NC}"
+    cd /usr/local/directadmin/custombuild
+    ./build rewrite_confs
+
+    echo -e "${YELLOW}[INFO] Restarting OpenLiteSpeed...${NC}"
+    if /usr/local/lsws/bin/lswsctrl restart 2>/dev/null; then
+        echo -e "${GREEN}[OK] OLS restarted${NC}"
+    elif systemctl restart lshttpd 2>/dev/null; then
+        echo -e "${GREEN}[OK] OLS restarted via systemctl${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Could not restart OLS automatically${NC}"
+    fi
+
+    echo -e "${GREEN}[OK] 8G Firewall installed for DirectAdmin + OLS${NC}"
 }
+
+#===============================================================================
+# UNINSTALL
+#===============================================================================
 
 uninstall() {
     echo -e "${YELLOW}[INFO] Uninstalling 8G Firewall...${NC}"
-    
-    if [ -f "$APACHE_CONF" ]; then
-        # Remove include line and comment
-        sed -i '/# 8G FIREWALL GLOBAL INCLUDE/d' "$APACHE_CONF"
-        sed -i "/Include $CUSTOM_CONF/d" "$APACHE_CONF"
-        echo -e "${GREEN}[OK] Removed Include from $APACHE_CONF${NC}"
+
+    # cPanel Apache / LiteSpeed
+    local cpanel_conf="/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+    if [[ -f "$cpanel_conf" ]] && grep -q "$MARKER_START" "$cpanel_conf" 2>/dev/null; then
+        local tmpfile
+        tmpfile=$(mktemp)
+        sed "/$MARKER_START/,/$MARKER_END/d" "$cpanel_conf" > "$tmpfile"
+        mv "$tmpfile" "$cpanel_conf"
+        echo -e "${GREEN}[OK] Removed from $cpanel_conf${NC}"
+        if [[ "$PANEL" == "cpanel" ]]; then
+            /scripts/rebuildhttpdconf
+            if [[ "$WEBSERVER" == "litespeed" ]]; then
+                /usr/local/lsws/bin/lswsctrl restart 2>/dev/null || service lsws restart 2>/dev/null || true
+            else
+                /scripts/restartsrv_httpd 2>/dev/null || true
+            fi
+        fi
     fi
-    
-    if [ -f "$CUSTOM_CONF" ]; then
-        mv "$CUSTOM_CONF" "$BACKUP_DIR/8g-firewall.conf.removed.$(date +%Y%m%d_%H%M%S)"
-        echo -e "${GREEN}[OK] Removed $CUSTOM_CONF${NC}"
+
+    # DirectAdmin Apache
+    local da_apache_conf="/usr/local/apache/conf/httpd.conf"
+    local da_custom="/usr/local/apache/conf/extra/8g-firewall.conf"
+    if [[ -f "$da_apache_conf" ]] && grep -q "8g-firewall.conf" "$da_apache_conf" 2>/dev/null; then
+        sed -i '/8g-firewall.conf/d' "$da_apache_conf"
+        rm -f "$da_custom"
+        echo -e "${GREEN}[OK] Removed from DirectAdmin Apache${NC}"
+        cd /usr/local/directadmin/custombuild 2>/dev/null && ./build rewrite_confs 2>/dev/null || true
     fi
-    
-    if $APACHE_BIN -t 2>/dev/null; then
-        reload_apache
-        echo -e "${GREEN}[OK] Uninstalled successfully${NC}"
-    else
-        echo -e "${RED}[WARN] Apache config test failed after removal${NC}"
+
+    # DirectAdmin OLS
+    local da_ols_custom="/usr/local/directadmin/data/templates/custom/openlitespeed_vhost.conf.CUSTOM.5.pre"
+    if [[ -f "$da_ols_custom" ]]; then
+        rm -f "$da_ols_custom"
+        echo -e "${GREEN}[OK] Removed OLS custom template${NC}"
+        cd /usr/local/directadmin/custombuild 2>/dev/null && ./build rewrite_confs 2>/dev/null || true
+        /usr/local/lsws/bin/lswsctrl restart 2>/dev/null || true
     fi
+
+    # cPanel nginx
+    rm -f /etc/nginx/conf.d/8g-firewall-maps.conf
+    rm -f /etc/nginx/conf.d/8g-firewall-server.conf
+    if [[ -d /var/cpanel/templates/nginx ]]; then
+        for tmpl in /var/cpanel/templates/nginx/*.tmpl /var/cpanel/templates/nginx/vhost/*.tmpl /var/cpanel/templates/nginx/vhost.local/*.tmpl 2>/dev/null; do
+            [[ -f "$tmpl" ]] || continue
+            sed -i '/8g-firewall-server.conf/d' "$tmpl"
+        done
+    fi
+    if [[ -d /etc/nginx/conf.d/users ]]; then
+        for user_conf in /etc/nginx/conf.d/users/*.conf; do
+            [[ -f "$user_conf" ]] || continue
+            sed -i '/8g-firewall-server.conf/d' "$user_conf"
+        done
+    fi
+    nginx -t 2>/dev/null && /scripts/restartsrv_nginx 2>/dev/null || true
+
+    echo -e "${GREEN}[OK] 8G Firewall uninstalled${NC}"
 }
+
+#===============================================================================
+# STATUS
+#===============================================================================
 
 show_status() {
-    echo -e "${YELLOW}=== 8G Firewall Status ===${NC}"
-    
-    if [ -f "$CUSTOM_CONF" ]; then
-        echo -e "${GREEN}Status: INSTALLED${NC}"
-        echo -e "Config: $CUSTOM_CONF"
-        echo -e "Rules: $(grep -cE 'RewriteCond|RewriteRule' "$CUSTOM_CONF") conditions/rules"
-    else
-        echo -e "${RED}Status: NOT INSTALLED${NC}"
+    echo -e "${BLUE}=== 8G Firewall Status ===${NC}"
+    echo -e "Panel: ${PANEL:-unknown}"
+    echo -e "Web Server: ${WEBSERVER:-unknown}"
+    echo ""
+
+    local found=0
+
+    if [[ -f /etc/apache2/conf.d/includes/pre_virtualhost_global.conf ]]; then
+        if grep -q "$MARKER_START" /etc/apache2/conf.d/includes/pre_virtualhost_global.conf 2>/dev/null; then
+            echo -e "${GREEN}[INSTALLED] cPanel Apache/LiteSpeed${NC}"
+            found=1
+        fi
     fi
-    
-    if grep -q "8g-firewall.conf" "$APACHE_CONF" 2>/dev/null; then
-        echo -e "${GREEN}Included in: $APACHE_CONF${NC}"
-    else
-        echo -e "${RED}Not included in Apache config${NC}"
+
+    if [[ -f /usr/local/apache/conf/extra/8g-firewall.conf ]]; then
+        echo -e "${GREEN}[INSTALLED] DirectAdmin Apache${NC}"
+        found=1
+    fi
+
+    if [[ -f /usr/local/directadmin/data/templates/custom/openlitespeed_vhost.conf.CUSTOM.5.pre ]]; then
+        echo -e "${GREEN}[INSTALLED] DirectAdmin OLS${NC}"
+        found=1
+    fi
+
+    if [[ -f /etc/nginx/conf.d/8g-firewall-maps.conf ]]; then
+        echo -e "${GREEN}[INSTALLED] cPanel nginx (maps)${NC}"
+        found=1
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${RED}[NOT INSTALLED]${NC}"
     fi
 }
 
 #===============================================================================
-# Main
+# MAIN
 #===============================================================================
 
-echo "==============================================================================="
-echo "  8G FIREWALL v1.5 - DirectAdmin + Apache Global Deployment"
-echo "==============================================================================="
-echo ""
+usage() {
+    echo "Usage: $0 {install|uninstall|status|detect}"
+    echo ""
+    echo "  install   - Install 8G Firewall (default)"
+    echo "  uninstall - Remove 8G Firewall"
+    echo "  status    - Check installation status"
+    echo "  detect    - Show detected environment"
+    echo ""
+    echo "Supported configurations:"
+    echo "  - DirectAdmin + Apache"
+    echo "  - DirectAdmin + OpenLiteSpeed"
+    echo "  - cPanel + Apache"
+    echo "  - cPanel + ea-nginx"
+    echo "  - cPanel + LiteSpeed"
+    exit 1
+}
 
-check_root
-detect_apache
+main() {
+    check_root
 
-case "${1:-install}" in
-    install)
-        create_backup
-        create_8g_config
-        update_httpd_conf
-        verify_mod_rewrite
-        check_apache_syntax && reload_apache
-        echo ""
-        echo -e "${GREEN}=== 8G Firewall installed successfully! ===${NC}"
-        echo -e "${YELLOW}Backup: $BACKUP_DIR${NC}"
-        echo -e "${YELLOW}Config: $CUSTOM_CONF${NC}"
-        echo ""
-        echo "Test: curl -I 'http://yourdomain.com/?cmd=shell'"
-        echo "Expected: HTTP/1.1 403 Forbidden"
-        ;;
-    uninstall|remove)
-        uninstall
-        ;;
-    status)
-        show_status
-        ;;
-    test)
-        check_apache_syntax
-        ;;
-    *)
-        echo "Usage: $0 {install|uninstall|status|test}"
-        echo ""
-        echo "  install   - Install 8G Firewall globally (default)"
-        echo "  uninstall - Remove 8G Firewall"
-        echo "  status    - Check installation status"
-        echo "  test      - Test Apache configuration syntax"
-        exit 1
-        ;;
-esac
-'''
+    case "${1:-install}" in
+        detect)
+            detect_panel
+            detect_webserver
+            echo ""
+            echo "Detected: $PANEL + $WEBSERVER"
+            ;;
+        install)
+            detect_panel
+            detect_webserver
+            echo ""
+            echo "============================================================"
+            echo "  8G FIREWALL v1.5 - Unified Deployment"
+            echo "  Target: $PANEL + $WEBSERVER"
+            echo "============================================================"
+            echo ""
 
-with open('/mnt/agents/output/install-8g-apache.sh', 'w') as f:
-    f.write(apache_script)
+            case "$PANEL:$WEBSERVER" in
+                cpanel:apache)
+                    install_cpanel_apache
+                    ;;
+                cpanel:litespeed)
+                    install_cpanel_litespeed
+                    ;;
+                cpanel:nginx)
+                    install_cpanel_nginx
+                    ;;
+                directadmin:apache)
+                    install_da_apache
+                    ;;
+                directadmin:openlitespeed)
+                    install_da_ols
+                    ;;
+                directadmin:litespeed)
+                    echo -e "${YELLOW}[INFO] DirectAdmin + LiteSpeed Enterprise detected.${NC}"
+                    echo -e "${YELLOW}        Treating as Apache-compatible configuration.${NC}"
+                    install_da_apache
+                    ;;
+                *)
+                    echo -e "${RED}Error: Unsupported combination: $PANEL + $WEBSERVER${NC}"
+                    exit 1
+                    ;;
+            esac
 
-print(f"Apache script: {len(apache_script)} bytes")
-print("Saved to /mnt/agents/output/install-8g-apache.sh")
+            echo ""
+            echo -e "${GREEN}=== Installation Complete ===${NC}"
+            echo -e "${YELLOW}Backups saved to: $BACKUP_DIR${NC}"
+            echo ""
+            echo "Test with: curl -I 'http://yourdomain.com/?cmd=shell'"
+            echo "Expected: HTTP/1.1 403 Forbidden"
+            ;;
+        uninstall)
+            detect_panel
+            detect_webserver
+            uninstall
+            ;;
+        status)
+            detect_panel
+            detect_webserver
+            show_status
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+main "$@"
