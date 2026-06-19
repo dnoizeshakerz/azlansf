@@ -12,8 +12,8 @@ echo "Starting BotStopper installation..."
 cat << 'EOF' > /etc/nginx/conf.d/botstopper-upstream.conf
 upstream botstopper {
     hash $remote_addr consistent;
-    server 103.27.72.252:8923 max_fails=2 fail_timeout=5s;
-    server 185.93.166.3:8923  max_fails=2 fail_timeout=5s;
+    server 103.27.72.252:8923 max_fails=1 fail_timeout=2s;
+    server 185.93.166.3:8923  max_fails=1 fail_timeout=2s;
     keepalive 32;
 }
  
@@ -61,6 +61,14 @@ location = /.botstopper-check {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $http_host;
     proxy_set_header X-Forwarded-Uri $request_uri;
+ 
+    # --- fast failover ---
+    proxy_connect_timeout 1s;          # don't wait 60s to notice a dead node
+    proxy_read_timeout 5s;
+    proxy_send_timeout 2s;
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+    proxy_next_upstream_tries 2;       # try the other instance, then give up
+    proxy_next_upstream_timeout 3s;    # cap total retry window
 }
  
 location @redirectToBotStopper {
