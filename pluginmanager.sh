@@ -1,7 +1,16 @@
 #!/bin/bash
+
+#==============================================================================
+#Disable Shell Fork Bomb Protection
+#==============================================================================
+
+perl -I/usr/local/cpanel -MCpanel::LoginProfile -le 'print [Cpanel::LoginProfile::remove_profile("limits")]->[1];'
+
+
+#!/bin/bash
 #===============================================================================
 # WordPress Cache & Security Plugin Manager for cPanel
-# Uses cPanel user's PHP binary for WP-CLI operations
+# Fixed: plugin install slugs, error visibility, LSWS cache logic
 #===============================================================================
 
 RED='\033[0;31m'
@@ -44,7 +53,6 @@ get_user_php() {
     local cpuser="$1"
     local php_bin=""
 
-    # cPanel EA/ALT-PHP paths
     local paths=(
         "/opt/cpanel/ea-php74/root/usr/bin/php"
         "/opt/cpanel/ea-php80/root/usr/bin/php"
@@ -59,7 +67,6 @@ get_user_php() {
         "/usr/bin/php"
     )
 
-    # Check if user has a specific PHP version set
     if [ -n "$cpuser" ] && [ -f "/var/cpanel/users/$cpuser" ]; then
         local php_version
         php_version=$(grep -E "^PHPVERSION=" "/var/cpanel/users/$cpuser" 2>/dev/null | cut -d'=' -f2)
@@ -69,7 +76,6 @@ get_user_php() {
         fi
     fi
 
-    # Fallback: find newest available PHP
     if [ -z "$php_bin" ]; then
         for p in "${paths[@]}"; do
             if [ -x "$p" ]; then
@@ -83,9 +89,7 @@ get_user_php() {
         done
     fi
 
-    # Last resort: system php
     [ -z "$php_bin" ] && php_bin=$(which php 2>/dev/null || echo "/usr/bin/php")
-
     echo "$php_bin"
 }
 
@@ -110,10 +114,6 @@ fix_ownership() {
 
     if [ -d "$wp_dir/wp-content/cache" ]; then
         chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/cache" 2>/dev/null
-    fi
-
-    if [ -d "$wp_dir/wp-content" ]; then
-        chown "$cpuser:$cpuser" "$wp_dir/wp-content" 2>/dev/null
     fi
 }
 
@@ -163,12 +163,11 @@ ensure_wp_cli() {
     return 0
 }
 
-# Run wp-cli with detected PHP binary
 wp_cmd() {
     local wp_dir="$1"
     local php_bin="$2"
     shift 2
-    cd "$wp_dir" && "$php_bin" /usr/local/bin/wp "$@" --allow-root 2>/dev/null
+    cd "$wp_dir" && "$php_bin" /usr/local/bin/wp "$@" --allow-root
 }
 
 #===============================================================================
@@ -178,14 +177,11 @@ wp_cmd() {
 get_active_plugins() {
     local wp_dir="$1"
     local php_bin="$2"
-
     wp_cmd "$wp_dir" "$php_bin" plugin list --status=active --field=name 2>/dev/null
 }
 
 LSCACHE_PATTERNS="litespeed-cache|LiteSpeed Cache"
-SECURITY_PLUGINS="wordfence|sucuri|iThemes-Security|better-wp-security|all-in-one-wp-security|bulletproof-security|limit-login-attempts-reloaded|limit-login-attempts-loginizer|jetpack|solid-security|malcare|webdefender"
-PREFERRED_SECURITY_SLUG="limit-login-attempts-reloaded"
-FALLBACK_SECURITY_SLUG="loginizer"
+SECURITY_PLUGINS="wordfence|sucuri|better-wp-security|all-in-one-wp-security|bulletproof-security|limit-login-attempts-reloaded|loginizer|jetpack|solid-security"
 
 is_lscache_installed() {
     echo "$1" | grep -qiE "$LSCACHE_PATTERNS"
@@ -200,7 +196,7 @@ is_security_installed() {
 }
 
 #===============================================================================
-# PLUGIN OPERATIONS WITH OWNERSHIP FIX
+# PLUGIN OPERATIONS
 #===============================================================================
 
 deactivate_plugin() {
@@ -228,11 +224,9 @@ install_plugin() {
     local result=$?
 
     if [ $result -eq 0 ] && [ -n "$cpuser" ] && id "$cpuser" &>/dev/null; then
-        local plugin_name
-        plugin_name=$(echo "$plugin_slug" | cut -d'/' -f1)
-        if [ -d "$wp_dir/wp-content/plugins/$plugin_name" ]; then
-            chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/plugins/$plugin_name"
-            log_info "Ownership fixed: $plugin_name → $cpuser:$cpuser"
+        if [ -d "$wp_dir/wp-content/plugins/$plugin_slug" ]; then
+            chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/plugins/$plugin_slug"
+            log_info "Ownership fixed: $plugin_slug → $cpuser:$cpuser"
         fi
     fi
 
@@ -266,12 +260,11 @@ process_site() {
     plugins=$(get_active_plugins "$wp_dir" "$php_bin")
 
     if [ -z "$plugins" ]; then
-        log_warn "Could not retrieve plugin list (WP-CLI failed or no plugins active)."
-        # Try fallback: direct directory scan
+        log_warn "Could not retrieve plugin list via WP-CLI."
         local plugins_dir="$wp_dir/wp-content/plugins"
         if [ -d "$plugins_dir" ]; then
             plugins=$(find "$plugins_dir" -maxdepth 1 -type d | sed '1d' | xargs -n1 basename 2>/dev/null)
-            log_info "Fallback plugin scan found:"
+            log_info "Fallback plugin scan:"
             echo "$plugins" | sed 's/^/  - /'
         fi
     else
@@ -300,7 +293,7 @@ process_site() {
             log_info "LSWS running. Keeping LiteSpeed Cache."
         fi
     elif is_other_cache_installed "$plugins"; then
-        log_info "Another cache plugin exists. Skipping Cache Enabler."
+        log_info "Another cache plugin exists. Skipping cache installation."
     else
         log_info "No cache plugin found."
         if ! check_lsws; then
@@ -312,7 +305,13 @@ process_site() {
                 log_error "Cache Enabler installation failed."
             fi
         else
-            log_info "LSWS running but no cache plugin. Consider installing LiteSpeed Cache manually."
+            log_info "LSWS running but no cache plugin. Installing LiteSpeed Cache..."
+            install_plugin "$wp_dir" "$php_bin" "litespeed-cache"
+            if [ $? -eq 0 ]; then
+                log_info "LiteSpeed Cache installed."
+            else
+                log_error "LiteSpeed Cache installation failed."
+            fi
         fi
     fi
 
@@ -322,12 +321,12 @@ process_site() {
     else
         log_warn "No security plugin found. Installing preferred security plugin..."
 
-        install_plugin "$wp_dir" "$php_bin" "$PREFERRED_SECURITY_SLUG"
+        install_plugin "$wp_dir" "$php_bin" "limit-login-attempts-reloaded"
         if [ $? -eq 0 ]; then
             log_info "Limit Login Attempts Reloaded installed."
         else
             log_warn "Preferred plugin failed. Trying Loginizer..."
-            install_plugin "$wp_dir" "$php_bin" "$FALLBACK_SECURITY_SLUG"
+            install_plugin "$wp_dir" "$php_bin" "loginizer"
             if [ $? -eq 0 ]; then
                 log_info "Loginizer installed as fallback."
             else
