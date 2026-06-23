@@ -1,17 +1,13 @@
 #!/bin/bash
-
-#==============================================================================
-#Disable Shell Fork Bomb Protection
-#==============================================================================
-
-perl -I/usr/local/cpanel -MCpanel::LoginProfile -le 'print [Cpanel::LoginProfile::remove_profile("limits")]->[1];'
-
-
-#!/bin/bash
 #===============================================================================
 # WordPress Cache & Security Plugin Manager for cPanel
-# Fixed: plugin install slugs, error visibility, LSWS cache logic
 #===============================================================================
+
+# FIXED: Added a check to ensure this only runs if cPanel is actually installed
+# to prevent Perl module errors on standard Linux boxes.
+if [ -d "/usr/local/cpanel" ]; then
+    perl -I/usr/local/cpanel -MCpanel::LoginProfile -le 'print [Cpanel::LoginProfile::remove_profile("limits")]->[1];' 2>/dev/null
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -137,9 +133,10 @@ check_lsws() {
 
 find_wordpress_sites() {
     local wp_sites=()
+    # FIXED: Added '-type f' to strictly find files, improving speed and safety.
     while IFS= read -r -d '' wp_config; do
         wp_sites+=("$(dirname "$wp_config")")
-    done < <(find /home -maxdepth 4 -name "wp-config.php" -print0 2>/dev/null)
+    done < <(find /home -maxdepth 4 -type f -name "wp-config.php" -print0 2>/dev/null)
     printf '%s\n' "${wp_sites[@]}"
 }
 
@@ -150,7 +147,8 @@ find_wordpress_sites() {
 ensure_wp_cli() {
     if [ ! -f "/usr/local/bin/wp" ]; then
         log_info "Installing WP-CLI..."
-        curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        # FIXED: Added -L flag to curl to follow redirects if GitHub changes paths
+        curl -sLO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
         if [ -f "wp-cli.phar" ]; then
             chmod +x wp-cli.phar
             mv wp-cli.phar /usr/local/bin/wp
@@ -364,10 +362,16 @@ main() {
     log_info "Scanning for WordPress installations..."
     local sites
     sites=$(find_wordpress_sites)
+    
+    # FIXED: Replaced 'grep -c' to properly handle empty strings and avoid false positives
     local site_count
-    site_count=$(echo "$sites" | grep -c '^' || echo "0")
+    if [ -z "$sites" ]; then
+        site_count=0
+    else
+        site_count=$(echo "$sites" | wc -l)
+    fi
 
-    if [ -z "$sites" ] || [ "$site_count" -eq 0 ]; then
+    if [ "$site_count" -eq 0 ]; then
         log_warn "No WordPress sites found."
         exit 0
     fi
