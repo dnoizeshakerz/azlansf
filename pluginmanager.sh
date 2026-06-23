@@ -184,8 +184,8 @@ get_active_plugins() {
 
 LSCACHE_PATTERNS="litespeed-cache|LiteSpeed Cache"
 SECURITY_PLUGINS="wordfence|sucuri|iThemes-Security|better-wp-security|all-in-one-wp-security|bulletproof-security|limit-login-attempts-reloaded|limit-login-attempts-loginizer|jetpack|solid-security|malcare|webdefender"
-PREFERRED_SECURITY_SLUG="limit-login-attempts-reloaded/limit-login-attempts-reloaded.php"
-FALLBACK_SECURITY_SLUG="loginizer/loginizer.php"
+PREFERRED_SECURITY_SLUG="limit-login-attempts-reloaded"
+FALLBACK_SECURITY_SLUG="loginizer"
 
 is_lscache_installed() {
     echo "$1" | grep -qiE "$LSCACHE_PATTERNS"
@@ -290,7 +290,7 @@ process_site() {
             rm -rf "$wp_dir/wp-content/litespeed" 2>/dev/null
             rm -f "$wp_dir/.htaccess.litespeed" 2>/dev/null
 
-            install_plugin "$wp_dir" "$php_bin" "cache-enabler/cache-enabler.php"
+            install_plugin "$wp_dir" "$php_bin" "cache-enabler"
             if [ $? -eq 0 ]; then
                 log_info "Cache Enabler installed."
             else
@@ -305,7 +305,7 @@ process_site() {
         log_info "No cache plugin found."
         if ! check_lsws; then
             log_info "Installing Cache Enabler..."
-            install_plugin "$wp_dir" "$php_bin" "cache-enabler/cache-enabler.php"
+            install_plugin "$wp_dir" "$php_bin" "cache-enabler"
             if [ $? -eq 0 ]; then
                 log_info "Cache Enabler installed."
             else
