@@ -1,10 +1,10 @@
 #!/bin/bash
 #===============================================================================
-# WordPress Cache & Security Plugin Manager for cPanel
+# Universal WordPress Cache & Security Plugin Manager
+# Compatible with cPanel (EasyApache) and DirectAdmin (CustomBuild)
 #===============================================================================
 
-# FIXED: Added a check to ensure this only runs if cPanel is actually installed
-# to prevent Perl module errors on standard Linux boxes.
+# Disable Shell Fork Bomb Protection safely (cPanel only)
 if [ -d "/usr/local/cpanel" ]; then
     perl -I/usr/local/cpanel -MCpanel::LoginProfile -le 'print [Cpanel::LoginProfile::remove_profile("limits")]->[1];' 2>/dev/null
 fi
@@ -22,56 +22,68 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 #===============================================================================
-# CPANEL USER & PHP DETECTION
+# USER & PHP DETECTION (UNIVERSAL)
 #===============================================================================
 
-get_cpanel_user() {
+get_user() {
     local wp_dir="$1"
-    local cpuser=""
+    local system_user=""
 
+    # Extracts the user from /home/USER/ path structure (works for both panels)
     if [[ "$wp_dir" == /home/* ]]; then
-        cpuser=$(echo "$wp_dir" | cut -d'/' -f3)
+        system_user=$(echo "$wp_dir" | cut -d'/' -f3)
     fi
 
-    if [ -n "$cpuser" ] && id "$cpuser" &>/dev/null; then
-        echo "$cpuser"
+    # Verify user exists
+    if [ -n "$system_user" ] && id "$system_user" &>/dev/null; then
+        echo "$system_user"
         return
     fi
 
+    # Fallback: check wp-config.php file ownership
     if [ -f "$wp_dir/wp-config.php" ]; then
-        cpuser=$(stat -c '%U' "$wp_dir/wp-config.php" 2>/dev/null)
+        system_user=$(stat -c '%U' "$wp_dir/wp-config.php" 2>/dev/null)
     fi
 
-    echo "$cpuser"
+    echo "$system_user"
 }
 
 get_user_php() {
-    local cpuser="$1"
+    local system_user="$1"
     local php_bin=""
 
+    # Comprehensive list of PHP paths for cPanel, CloudLinux, and DirectAdmin
     local paths=(
-        "/opt/cpanel/ea-php74/root/usr/bin/php"
-        "/opt/cpanel/ea-php80/root/usr/bin/php"
-        "/opt/cpanel/ea-php81/root/usr/bin/php"
-        "/opt/cpanel/ea-php82/root/usr/bin/php"
         "/opt/cpanel/ea-php83/root/usr/bin/php"
-        "/opt/alt/php74/usr/bin/php"
-        "/opt/alt/php80/usr/bin/php"
-        "/opt/alt/php81/usr/bin/php"
+        "/opt/cpanel/ea-php82/root/usr/bin/php"
+        "/opt/cpanel/ea-php81/root/usr/bin/php"
+        "/opt/cpanel/ea-php80/root/usr/bin/php"
+        "/opt/cpanel/ea-php74/root/usr/bin/php"
+        "/opt/alt/php83/usr/bin/php"
         "/opt/alt/php82/usr/bin/php"
+        "/opt/alt/php81/usr/bin/php"
+        "/opt/alt/php80/usr/bin/php"
+        "/opt/alt/php74/usr/bin/php"
+        "/usr/local/php83/bin/php"
+        "/usr/local/php82/bin/php"
+        "/usr/local/php81/bin/php"
+        "/usr/local/php80/bin/php"
+        "/usr/local/php74/bin/php"
         "/usr/local/bin/php"
         "/usr/bin/php"
     )
 
-    if [ -n "$cpuser" ] && [ -f "/var/cpanel/users/$cpuser" ]; then
+    # Fast-path for cPanel users (reads their specific PHP selector file)
+    if [ -n "$system_user" ] && [ -f "/var/cpanel/users/$system_user" ]; then
         local php_version
-        php_version=$(grep -E "^PHPVERSION=" "/var/cpanel/users/$cpuser" 2>/dev/null | cut -d'=' -f2)
+        php_version=$(grep -E "^PHPVERSION=" "/var/cpanel/users/$system_user" 2>/dev/null | cut -d'=' -f2)
         if [ -n "$php_version" ]; then
             local ea_path="/opt/cpanel/ea-php${php_version}/root/usr/bin/php"
             [ -x "$ea_path" ] && php_bin="$ea_path"
         fi
     fi
 
+    # Fallback to scanning standard paths for the newest compatible PHP
     if [ -z "$php_bin" ]; then
         for p in "${paths[@]}"; do
             if [ -x "$p" ]; then
@@ -85,6 +97,7 @@ get_user_php() {
         done
     fi
 
+    # Ultimate fallback to system default
     [ -z "$php_bin" ] && php_bin=$(which php 2>/dev/null || echo "/usr/bin/php")
     echo "$php_bin"
 }
@@ -95,21 +108,21 @@ get_user_php() {
 
 fix_ownership() {
     local wp_dir="$1"
-    local cpuser
-    cpuser=$(get_cpanel_user "$wp_dir")
+    local system_user
+    system_user=$(get_user "$wp_dir")
 
-    if [ -z "$cpuser" ] || ! id "$cpuser" &>/dev/null; then
-        log_warn "Could not determine cPanel user for $wp_dir"
+    if [ -z "$system_user" ] || ! id "$system_user" &>/dev/null; then
+        log_warn "Could not determine system user for $wp_dir"
         return 1
     fi
 
     if [ -d "$wp_dir/wp-content/plugins" ]; then
-        chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/plugins"
-        log_info "Ownership fixed: wp-content/plugins → $cpuser:$cpuser"
+        chown -R "$system_user:$system_user" "$wp_dir/wp-content/plugins"
+        log_info "Ownership fixed: wp-content/plugins → $system_user:$system_user"
     fi
 
     if [ -d "$wp_dir/wp-content/cache" ]; then
-        chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/cache" 2>/dev/null
+        chown -R "$system_user:$system_user" "$wp_dir/wp-content/cache" 2>/dev/null
     fi
 }
 
@@ -133,10 +146,10 @@ check_lsws() {
 
 find_wordpress_sites() {
     local wp_sites=()
-    # FIXED: Added '-type f' to strictly find files, improving speed and safety.
+    # Scans deeper to catch DirectAdmin's /domains/domain.com/public_html structure
     while IFS= read -r -d '' wp_config; do
         wp_sites+=("$(dirname "$wp_config")")
-    done < <(find /home -maxdepth 4 -type f -name "wp-config.php" -print0 2>/dev/null)
+    done < <(find /home -maxdepth 6 -type f -name "wp-config.php" -print0 2>/dev/null)
     printf '%s\n' "${wp_sites[@]}"
 }
 
@@ -147,7 +160,7 @@ find_wordpress_sites() {
 ensure_wp_cli() {
     if [ ! -f "/usr/local/bin/wp" ]; then
         log_info "Installing WP-CLI..."
-        # FIXED: Added -L flag to curl to follow redirects if GitHub changes paths
+        # Utilizes -L to follow potential GitHub redirects
         curl -sLO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
         if [ -f "wp-cli.phar" ]; then
             chmod +x wp-cli.phar
@@ -215,16 +228,16 @@ install_plugin() {
     local wp_dir="$1"
     local php_bin="$2"
     local plugin_slug="$3"
-    local cpuser
-    cpuser=$(get_cpanel_user "$wp_dir")
+    local system_user
+    system_user=$(get_user "$wp_dir")
 
     wp_cmd "$wp_dir" "$php_bin" plugin install "$plugin_slug" --activate
     local result=$?
 
-    if [ $result -eq 0 ] && [ -n "$cpuser" ] && id "$cpuser" &>/dev/null; then
+    if [ $result -eq 0 ] && [ -n "$system_user" ] && id "$system_user" &>/dev/null; then
         if [ -d "$wp_dir/wp-content/plugins/$plugin_slug" ]; then
-            chown -R "$cpuser:$cpuser" "$wp_dir/wp-content/plugins/$plugin_slug"
-            log_info "Ownership fixed: $plugin_slug → $cpuser:$cpuser"
+            chown -R "$system_user:$system_user" "$wp_dir/wp-content/plugins/$plugin_slug"
+            log_info "Ownership fixed: $plugin_slug → $system_user:$system_user"
         fi
     fi
 
@@ -246,12 +259,12 @@ process_site() {
         return
     fi
 
-    local cpuser
-    cpuser=$(get_cpanel_user "$wp_dir")
-    log_info "cPanel user: $cpuser"
+    local system_user
+    system_user=$(get_user "$wp_dir")
+    log_info "System user: $system_user"
 
     local php_bin
-    php_bin=$(get_user_php "$cpuser")
+    php_bin=$(get_user_php "$system_user")
     log_info "Using PHP: $php_bin ($("$php_bin" -r "echo PHP_VERSION;" 2>/dev/null))"
 
     local plugins
@@ -343,7 +356,7 @@ process_site() {
 
 main() {
     log_info "=========================================="
-    log_info "WordPress Plugin Manager Started"
+    log_info "Universal WordPress Plugin Manager Started"
     log_info "Date: $(date)"
     log_info "=========================================="
 
@@ -363,7 +376,6 @@ main() {
     local sites
     sites=$(find_wordpress_sites)
     
-    # FIXED: Replaced 'grep -c' to properly handle empty strings and avoid false positives
     local site_count
     if [ -z "$sites" ]; then
         site_count=0
