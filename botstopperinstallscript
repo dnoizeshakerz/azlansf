@@ -12,17 +12,17 @@ echo "Starting BotStopper installation..."
 cat << 'EOF' > /etc/nginx/conf.d/botstopper-upstream.conf
 upstream botstopper {
     hash $remote_addr consistent;
-    server 103.27.72.252:8923 max_fails=1 fail_timeout=2s;
     server 185.93.166.3:8923  max_fails=1 fail_timeout=2s;
+    server 103.27.72.252:8923 max_fails=1 fail_timeout=2s;
     keepalive 32;
 }
- 
+ 
 # Bypass BotStopper on cPanel service subdomains
-map $host $botstopper_bypass {
+map $host $botstopper_bypass_host {
     default 0;
     "~*^(?:cpanel|whm|webmail|webdisk|cpcalendars|cpcontacts|autodiscover|autoconfig)\." 1;
 }
-
+ 
 # Bypass BotStopper for trusted crawler ecosystems (Meta + Google)
 # NOTE: UA-only match, no IP verification — spoofable. Googlebot especially.
 map $http_user_agent $botstopper_bypass_ua {
@@ -30,13 +30,14 @@ map $http_user_agent $botstopper_bypass_ua {
     "~*(facebookexternalhit|facebookcatalog|Meta-ExternalAgent|Meta-ExternalFetcher|Instagram|WhatsApp|Messenger|MetaTrademark|Meta-Commerce-Platform|Meta-Verification)" 1;
     "~*(AdsBot-Google|Google-Adwords-Instant|Googlebot|Googlebot-Image|Googlebot-News|Googlebot-Video|Google-InspectionTool|Storebot-Google|Mediapartners-Google|Google-Safety|Google-Read-Aloud|GoogleProducer|GoogleSites|GoogleOther|GoogleOther-Image|GoogleImageProxy|GoogleOther-Video|FeedFetcher-Google)" 1;
 }
-
+ 
+ 
+ 
 # Combine: bypass if host OR UA matched
 map "$botstopper_bypass_host$botstopper_bypass_ua" $botstopper_bypass {
     default 1;     # any "1" present -> bypass
     "00" 0;        # neither matched -> enforce
 }
-
 EOF
 echo "✅ Created /etc/nginx/conf.d/botstopper-upstream.conf"
 
