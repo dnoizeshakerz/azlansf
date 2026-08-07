@@ -17,7 +17,7 @@ upstream botstopper {
     keepalive 32;
 }
 
-# Whitelist specific IP addresses:|Zetpu|Doku|
+# Whitelist specific IP addresses:|Zetpy|Doku|
 map $remote_addr $ip_whitelisted {
     default 0;
     18.136.44.161 1;
