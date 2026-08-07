@@ -12,32 +12,55 @@ echo "Starting BotStopper installation..."
 cat << 'EOF' > /etc/nginx/conf.d/botstopper-upstream.conf
 upstream botstopper {
     hash $remote_addr consistent;
-    server 185.93.166.3:8923  max_fails=1 fail_timeout=2s;
     server 103.27.72.252:8923 max_fails=1 fail_timeout=2s;
+    server 185.93.166.3:8923  max_fails=1 fail_timeout=2s;
     keepalive 32;
 }
- 
-# Bypass BotStopper on cPanel service subdomains
+
+# Whitelist specific IP addresses:|Zetpu|Doku|
+map $remote_addr $ip_whitelisted {
+    default 0;
+    18.136.44.161 1;
+    52.76.220.71   1;
+    18.136.75.246  1;
+    121.123.49.98  1;
+    147.139.129.160 1;
+    149.129.217.17 1;
+    149.129.219.140 1;
+    47.254.248.197 1;
+    47.250.12.92 1;
+
+}
+
+# Bypass BotStopper on cPanel service subdomains OR whitelisted IPs
 map $host $botstopper_bypass_host {
     default 0;
     "~*^(?:cpanel|whm|webmail|webdisk|cpcalendars|cpcontacts|autodiscover|autoconfig)\." 1;
 }
- 
+
+
+
+# Bypass BotStopper for any URI path containing "doku"
+map $request_uri $botstopper_bypass_uri {
+    default 0;
+    "~*doku" 1;
+}
+
 # Bypass BotStopper for trusted crawler ecosystems (Meta + Google)
 # NOTE: UA-only match, no IP verification — spoofable. Googlebot especially.
 map $http_user_agent $botstopper_bypass_ua {
     default 0;
     "~*(facebookexternalhit|facebookcatalog|Meta-ExternalAgent|Meta-ExternalFetcher|Instagram|WhatsApp|Messenger|MetaTrademark|Meta-Commerce-Platform|Meta-Verification)" 1;
-    "~*(AdsBot-Google|Google-Adwords-Instant|Googlebot|Googlebot-Image|Googlebot-News|Googlebot-Video|Google-InspectionTool|Storebot-Google|Mediapartners-Google|Google-Safety|Google-Read-Aloud|GoogleProducer|GoogleSites|GoogleOther|GoogleOther-Image|GoogleImageProxy|GoogleOther-Video|FeedFetcher-Google|Lighthouse)" 1;
+    "~*(AdsBot-Google|Google-Adwords-Instant|Googlebot|Googlebot-Image|Googlebot-News|Googlebot-Video|Google-InspectionTool|Storebot-Google|Mediapartners-Google|Google-Safety|Google-Read-Aloud|GoogleProducer|GoogleSites|GoogleOther|Goo$
 }
- 
- 
- 
-# Combine: bypass if host OR UA matched
-map "$botstopper_bypass_host$botstopper_bypass_ua" $botstopper_bypass {
-    default 1;     # any "1" present -> bypass
-    "00" 0;        # neither matched -> enforce
+
+
+# Combine host bypass and IP whitelist into a single condition
+map "$botstopper_bypass_host:$ip_whitelisted:$botstopper_bypass_ua:$botstopper_bypass_uri" $botstopper_bypass  {
+    default 0;
+    "~1" 1;  # If either host match OR IP match is 1, bypass set to 1
 }
+
 EOF
 echo "✅ Created /etc/nginx/conf.d/botstopper-upstream.conf"
 
