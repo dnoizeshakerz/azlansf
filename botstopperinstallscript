@@ -51,7 +51,7 @@ map $request_uri $botstopper_bypass_uri {
 map $http_user_agent $botstopper_bypass_ua {
     default 0;
     "~*(facebookexternalhit|facebookcatalog|FacebookBot|Meta-ExternalAgent|Meta-ExternalFetcher|Meta-WebIndexer|Instagram|WhatsApp|Messenger|MetaTrademark|Meta-Commerce-Platform|Meta-Verification|facebookplatform)" 1;
-    "~*(AdsBot-Google|Google-Adwords-Instant|Googlebot|Google-InspectionTool|Google-Extended|Storebot-Google|Mediapartners-Google|Google-Safety|Google-Read-Aloud|GoogleProducer|GoogleSites|GoogleOther|GoogleImageProxy|FeedFetcher-Google|APIs-Google|Google-Site-Verification|Duet-Google|Google Page Speed Insights)" 1;
+    "~*(AdsBot-Google|Google-Adwords-Instant|Googlebot|Google-InspectionTool|Google-Extended|Storebot-Google|Mediapartners-Google|Google-Safety|Google-Read-Aloud|GoogleProducer|GoogleSites|GoogleOther|GoogleImageProxy|FeedFetcher-Google|APIs-Google|Google-Site-Verification|Duet-Google|Google Page Speed Insights|Chrome-Lighthouse)" 1;
 }
 
 
